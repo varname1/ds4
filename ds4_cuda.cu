@@ -436,7 +436,19 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
+    /* The device-owned/registered shortcut describes only the mapping
+     * identified by g_model_host_base.  With --mtp two GGUF mappings are
+     * live at once and the last ds4_gpu_set_model_map() call owns the
+     * singleton: when the small MTP mapping registers after the base
+     * mapping failed to (e.g. cudaHostRegister OOM on an 80+ GiB mmap),
+     * taking this shortcut for the base map returns a raw unregistered
+     * host pointer via cuda_model_ptr(), and the next kernel that touches
+     * it dies with an illegal memory access.  Foreign maps must fall
+     * through to the per-range paths below, which key everything by host
+     * base.  (g_model_hmm_direct stays map-agnostic: HMM makes any host
+     * pointer device-legal system-wide.) */
+    if ((g_model_device_owned || g_model_registered) && model_map == g_model_host_base)
+        return cuda_model_ptr(model_map, offset);
     if (g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
@@ -458,7 +470,11 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
-    if (g_model_device_owned || g_model_registered || g_model_hmm_direct) return 1;
+    /* Same identity rule as cuda_model_range_ptr(): owned/registered only
+     * vouch for g_model_host_base's mapping.  Claiming a foreign map is
+     * "cached" makes the startup span preparation silently skip it. */
+    if (g_model_hmm_direct) return 1;
+    if ((g_model_device_owned || g_model_registered) && model_map == g_model_host_base) return 1;
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -1200,8 +1216,13 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
  * HMM-prefetched the mapping.  Otherwise let the caller try per-range mapping
  * or a device copy instead of surfacing an async illegal access later. */
 static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset) {
-    if (g_model_device_owned || g_model_registered || g_model_hmm_direct ||
-        getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+    if (g_model_hmm_direct || getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+        return cuda_model_ptr(model_map, offset);
+    }
+    /* owned/registered only vouch for g_model_host_base's mapping (see
+     * cuda_model_range_ptr); a foreign map here would yield a raw
+     * unregistered host pointer. */
+    if ((g_model_device_owned || g_model_registered) && model_map == g_model_host_base) {
         return cuda_model_ptr(model_map, offset);
     }
     return NULL;
@@ -1311,7 +1332,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL) {
         return 0;
     }
-    if (g_model_device_owned || g_model_registered) return 1;
+    if ((g_model_device_owned || g_model_registered) && model_map == g_model_host_base) return 1;
 
     void *dev = NULL;
     const double t0 = cuda_wall_sec();
