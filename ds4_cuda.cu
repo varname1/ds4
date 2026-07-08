@@ -3865,6 +3865,45 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     }
 }
 
+/* Coalesced re-tile of the ordered-chunks pair kernel below: one WARP per
+ * row (4 rows per 128-thread block) with stride-32 lane reads, so loads
+ * coalesce and the grid keeps its width.  The warp-shuffle reduction is a
+ * fixed tree - deterministic run-to-run, but a different summation order
+ * than the chunked loop (numerically equivalent, not bit-identical).
+ * Opt out with DS4_CUDA_NO_F16_RETILE=1. */
+__global__ static void matmul_f16_pair_warp4_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim) {
+    ds4_pdl_sync();
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint64_t row = (uint64_t)blockIdx.x * 4u + warp;
+    if (row >= out0_dim && row >= out1_dim) return;
+    const __half *wr0 = row < out0_dim ? w0 + row * in_dim : NULL;
+    const __half *wr1 = row < out1_dim ? w1 + row * in_dim : NULL;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (uint64_t i = lane; i < in_dim; i += 32u) {
+        const float xv = x[i];
+        if (wr0) sum0 += __half2float(wr0[i]) * xv;
+        if (wr1) sum1 += __half2float(wr1[i]) * xv;
+    }
+    for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, off);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, off);
+    }
+    if (lane == 0) {
+        if (row < out0_dim) out0[row] = sum0;
+        if (row < out1_dim) out1[row] = sum1;
+    }
+}
+
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         float *out0,
         float *out1,
@@ -4141,6 +4180,110 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) out[row] = acc;
+}
+
+/* K-split decode variants: the warp8 kernels above run one warp per output
+ * row, so small-out projections launch too few blocks to occupy an H200
+ * (e.g. the grouped attention low projection: low_dim=512 -> 64 blocks on
+ * 132 SMs).  Split the reduction dimension across blockIdx.y and combine
+ * with a fixed-order reduce (deterministic, but a different summation tree
+ * than the single-warp loop - numerically equivalent, not bit-identical). */
+__global__ static void matmul_q8_0_preq_warp8_ksplit_kernel(
+        float *partials,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        uint32_t chunk_blocks,
+        int use_dp4a) {
+    ds4_pdl_sync();
+    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const uint64_t b0 = (uint64_t)blockIdx.y * chunk_blocks;
+    uint64_t b1 = b0 + chunk_blocks;
+    if (b1 > blocks) b1 = blocks;
+    const unsigned char *wr = w + row * blocks * 34;
+    float acc = 0.0f;
+    for (uint64_t b = b0 + lane; b < b1; b += 32u) {
+        uint64_t i0 = b * 32;
+        uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const int8_t *xqb = xq + b * 32;
+        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) partials[(uint64_t)blockIdx.y * out_dim + row] = acc;
+}
+
+__global__ static void grouped_q8_0_a_preq_warp8_ksplit_kernel(
+        float *partials,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t group_dim,
+        uint64_t rank,
+        uint32_t n_groups,
+        uint64_t blocks,
+        uint32_t chunk_blocks,
+        int use_dp4a) {
+    ds4_pdl_sync();
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (row >= low_dim) return;
+    const uint64_t b0 = (uint64_t)blockIdx.y * chunk_blocks;
+    uint64_t b1 = b0 + chunk_blocks;
+    if (b1 > blocks) b1 = blocks;
+    const uint64_t group = row / rank;
+    const uint64_t row_in_group = row - group * rank;
+    const unsigned char *wr = w + (group * rank + row_in_group) * blocks * 34;
+    const int8_t *xqr = xq + group * blocks * 32;
+    const float *xsr = xscale + group * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = b0 + lane; b < b1; b += 32u) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const int8_t *xqb = xqr + b * 32;
+        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+        acc += __half2float(*scale_h) * xsr[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) partials[(uint64_t)blockIdx.y * low_dim + row] = acc;
+}
+
+__global__ static void ksplit_reduce_rows_kernel(
+        float *out,
+        const float *partials,
+        uint64_t out_dim,
+        uint32_t ksplit) {
+    ds4_pdl_sync();
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= out_dim) return;
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < ksplit; k++) acc += partials[(uint64_t)k * out_dim + row];
+    out[row] = acc;
+}
+
+static int cuda_q8_ksplit_factor(uint64_t out_dim, uint64_t blocks) {
+    /* Measured a wash on H200 decode (41.2-41.8 t/s off vs 40.1-41.3 on):
+     * the extra launches offset the occupancy gain for these stage shapes.
+     * Kept opt-in for tuning on other parts/shapes. */
+    static int env = -2;
+    if (env == -2) {
+        const char *e = getenv("DS4_CUDA_Q8_KSPLIT");
+        env = (e && e[0] && strcmp(e, "0") != 0) ? -1 : 0;
+    }
+    if (env == 0) return 1;
+    /* Row-starved regime only: small out (few warps) with enough K to split. */
+    if (out_dim > 4096u || blocks < 64u) return 1;
+    return 4;
 }
 
 __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
@@ -8295,7 +8438,11 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     const uint64_t xq_bytes = n_tok * blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + n_tok * blocks * sizeof(float);
+    const int ksplit = n_tok == 1 ? cuda_q8_ksplit_factor(out_dim, blocks) : 1;
+    const uint64_t scales_bytes = n_tok * blocks * sizeof(float);
+    const uint64_t partials_offset = (scale_offset + scales_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes = partials_offset +
+        (ksplit > 1 ? (uint64_t)ksplit * out_dim * sizeof(float) : 0u);
     void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
@@ -8304,6 +8451,17 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
     ds4_launch(quantize_q8_0_f32_kernel, qgrid, 32, 0, xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
+    if (n_tok == 1 && ksplit > 1) {
+        float *partials = (float *)((char *)tmp + partials_offset);
+        const uint32_t chunk_blocks = (uint32_t)((blocks + ksplit - 1) / (uint64_t)ksplit);
+        dim3 kgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)ksplit, 1);
+        ds4_launch(matmul_q8_0_preq_warp8_ksplit_kernel, kgrid, 256, 0, partials,
+            reinterpret_cast<const unsigned char *>(wptr), xq, xscale, in_dim, out_dim, blocks, chunk_blocks, use_dp4a);
+        if (!cuda_ok(cudaGetLastError(), label)) return 0;
+        ds4_launch(ksplit_reduce_rows_kernel, ((unsigned)out_dim + 255u) / 256u, 256, 0, (float *)out->ptr,
+            partials, out_dim, (uint32_t)ksplit);
+        return cuda_ok(cudaGetLastError(), label);
+    }
     if (n_tok == 1) {
         ds4_launch(matmul_q8_0_preq_warp8_kernel, ((unsigned)out_dim + 7u) / 8u, 256, 0, (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
@@ -8385,7 +8543,11 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
 
     const uint64_t xq_bytes = blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+    const uint64_t pair_max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    const int ksplit = cuda_q8_ksplit_factor(pair_max_out, blocks);
+    const uint64_t partials_offset = (scale_offset + blocks * sizeof(float) + 15u) & ~15ull;
+    const uint64_t tmp_bytes = partials_offset +
+        (ksplit > 1 ? (uint64_t)ksplit * (out0_dim + out1_dim) * sizeof(float) : 0u);
     void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 pair prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
@@ -8395,6 +8557,23 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     ds4_launch(quantize_q8_0_f32_kernel, qgrid, 32, 0, xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    if (ksplit > 1) {
+        const uint32_t chunk_blocks = (uint32_t)((blocks + ksplit - 1) / (uint64_t)ksplit);
+        float *p0 = (float *)((char *)tmp + partials_offset);
+        float *p1 = p0 + (uint64_t)ksplit * out0_dim;
+        dim3 kgrid0(((unsigned)out0_dim + 7u) / 8u, (unsigned)ksplit, 1);
+        ds4_launch(matmul_q8_0_preq_warp8_ksplit_kernel, kgrid0, 256, 0, p0,
+            reinterpret_cast<const unsigned char *>(w0), xq, xscale, in_dim, out0_dim, blocks, chunk_blocks, use_dp4a);
+        dim3 kgrid1(((unsigned)out1_dim + 7u) / 8u, (unsigned)ksplit, 1);
+        ds4_launch(matmul_q8_0_preq_warp8_ksplit_kernel, kgrid1, 256, 0, p1,
+            reinterpret_cast<const unsigned char *>(w1), xq, xscale, in_dim, out1_dim, blocks, chunk_blocks, use_dp4a);
+        if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair ksplit launch")) return 0;
+        ds4_launch(ksplit_reduce_rows_kernel, ((unsigned)out0_dim + 255u) / 256u, 256, 0, (float *)out0->ptr,
+            p0, out0_dim, (uint32_t)ksplit);
+        ds4_launch(ksplit_reduce_rows_kernel, ((unsigned)out1_dim + 255u) / 256u, 256, 0, (float *)out1->ptr,
+            p1, out1_dim, (uint32_t)ksplit);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair ksplit reduce launch");
+    }
     ds4_launch(matmul_q8_0_pair_preq_warp8_kernel, ((unsigned)max_out + 7u) / 8u, 256, 0, (float *)out0->ptr,
             (float *)out1->ptr,
             reinterpret_cast<const unsigned char *>(w0),
@@ -8590,6 +8769,17 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
     if (!w0 || !w1) return 0;
+    if (getenv("DS4_CUDA_NO_F16_RETILE") == NULL) {
+        ds4_launch(matmul_f16_pair_warp4_kernel, ((unsigned)out_dim + 3u) / 4u, 128, 0, (float *)out0->ptr,
+            (float *)out1->ptr,
+            w0,
+            w1,
+            (const float *)x->ptr,
+            in_dim,
+            out_dim,
+            out_dim);
+        return cuda_ok(cudaGetLastError(), "matmul_f16 pair warp4 launch");
+    }
     ds4_launch(matmul_f16_pair_ordered_chunks_kernel, (unsigned)out_dim, 32, 0, (float *)out0->ptr,
         (float *)out1->ptr,
         w0,
@@ -9993,7 +10183,11 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     const uint64_t x_rows = (uint64_t)n_groups;
     const uint64_t xq_bytes = x_rows * blocks_a * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + x_rows * blocks_a * sizeof(float);
+    const int ksplit = cuda_q8_ksplit_factor(low_dim, blocks_a);
+    const uint64_t scales_bytes = x_rows * blocks_a * sizeof(float);
+    const uint64_t partials_offset = (scale_offset + scales_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes = partials_offset +
+        (ksplit > 1 ? (uint64_t)ksplit * low_dim * sizeof(float) : 0u);
     void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output low q8 prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
@@ -10006,6 +10200,18 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
                                             group_dim,
                                             blocks_a);
     if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) return 0;
+    if (ksplit > 1) {
+        float *partials = (float *)((char *)tmp + partials_offset);
+        const uint32_t chunk_blocks = (uint32_t)((blocks_a + ksplit - 1) / (uint64_t)ksplit);
+        dim3 kgrid(((unsigned)low_dim + 7u) / 8u, (unsigned)ksplit, 1);
+        ds4_launch(grouped_q8_0_a_preq_warp8_ksplit_kernel, kgrid, 256, 0, partials,
+            out_a, xq, xscale, group_dim, rank, n_groups, blocks_a,
+            chunk_blocks, use_dp4a);
+        if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 ksplit launch")) return 0;
+        ds4_launch(ksplit_reduce_rows_kernel, ((unsigned)low_dim + 255u) / 256u, 256, 0, (float *)low->ptr,
+            partials, low_dim, (uint32_t)ksplit);
+        return cuda_ok(cudaGetLastError(), "attention_output_low_q8 reduce launch");
+    }
     dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
     ds4_launch(grouped_q8_0_a_preq_warp8_kernel, grid_a, 256, 0, (float *)low->ptr,
                                                       out_a,
@@ -11150,6 +11356,80 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_row32_kernel(
             gate_out[off] = gate;
             up_out[off] = up;
         }
+        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+    }
+}
+
+/* row16x2 variant: 16 rows per block with gate and up computed by SEPARATE
+ * quarter-warps (2x the parallelism of row32), combined through shared
+ * memory.  Each matrix's per-row dot uses the same 8-lane order as before,
+ * so the output is bit-identical.  Grid: (mid/16, n_expert). */
+__global__ static void moe_gate_up_mid_decode_lut_qwarp32_row16x2_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    ds4_pdl_sync();
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t octet = threadIdx.x >> 3u;      /* 0..31 */
+    uint32_t row_slot = octet >> 1u;         /* 0..15 */
+    uint32_t is_up = octet & 1u;
+    uint32_t pair = blockIdx.y;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    __shared__ cuda_block_q8_K sxq[16];
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ float s_gate[16];
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+        __syncthreads();
+        xqb = sxq;
+    }
+    uint32_t row = blockIdx.x * 16u + row_slot;
+    float acc = 0.0f;
+    if (row < expert_mid_dim) {
+        const char *base = is_up ? up_base : gate_base;
+        const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            acc += dev_dot_iq2_xxs_q8_K_block_lut(wr + b, xqb + b, s_iq2_grid, s_iq2_signs);
+        }
+        acc = quarter_warp_sum_f32(acc, lane);
+    }
+    /* gate octets publish; up octets combine */
+    if (row < expert_mid_dim && !is_up && lane == 0) {
+        float gate = acc;
+        if (clamp > 1.0e-6f && gate > clamp) gate = clamp;
+        s_gate[row_slot] = gate;
+        if (write_aux) gate_out[(uint64_t)pair * expert_mid_dim + row] = gate;
+    }
+    __syncthreads();
+    if (row < expert_mid_dim && is_up && lane == 0) {
+        float up = acc;
+        if (clamp > 1.0e-6f) {
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const float gate = s_gate[row_slot];
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        if (write_aux) up_out[off] = up;
         mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
     }
 }
@@ -13253,7 +13533,24 @@ static int routed_moe_launch(
                 const uint32_t use_decode_row32 =
                     !q4k_path && n_tokens == 1u && use_decode_lut_gate &&
                     getenv("DS4_CUDA_MOE_NO_DECODE_RETILE") == NULL;
-                if (use_decode_row32) {
+                if (use_decode_row32 && getenv("DS4_CUDA_MOE_NO_ROW16X2") == NULL) {
+                    dim3 wgrid((expert_mid_dim + 15u) / 16u, n_tokens * n_expert, 1);
+                    ds4_launch(moe_gate_up_mid_decode_lut_qwarp32_row16x2_kernel, wgrid, 256, 0, (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        gate_w,
+                        up_w,
+                        xq,
+                        selected_ptr,
+                        (const float *)weights->ptr,
+                        gate_expert_bytes,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        write_gate_up,
+                        clamp);
+                } else if (use_decode_row32) {
                     dim3 wgrid((expert_mid_dim + 31u) / 32u, n_tokens * n_expert, 1);
                     ds4_launch(moe_gate_up_mid_decode_lut_qwarp32_row32_kernel, wgrid, 256, 0, (float *)gate->ptr,
                         (float *)up->ptr,
