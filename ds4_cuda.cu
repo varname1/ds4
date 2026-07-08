@@ -2679,8 +2679,10 @@ extern "C" int ds4_gpu_token_capture_begin(uint64_t sig, int replay_ok) {
             /* Nothing ran; fall through to the capture/normal path below. */
         } else {
             g_token_graph_replays++;
-            if (g_token_graph_replays == 1) {
-                fprintf(stderr, "ds4: CUDA token graph replay active\n");
+            if (g_token_graph_replays == 1 || (g_token_graph_replays & 1023u) == 0) {
+                fprintf(stderr, "ds4: CUDA token graph replay stats: %llu replays, %llu captures\n",
+                        (unsigned long long)g_token_graph_replays,
+                        (unsigned long long)g_token_graph_launches);
             }
             if (!cuda_ok(cudaDeviceSynchronize(), "token graph replay")) return 4;
             return 3;

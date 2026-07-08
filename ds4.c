@@ -19502,6 +19502,13 @@ static int metal_graph_token_step_prepare(
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         if ((pos + 1u) % ratio == 0u) replay_ok = 0; /* compressor emit */
+        /* Comp-cache presence: while n_comp == 0 the attention launch bakes
+         * the raw_kv FALLBACK pointer for comp_kv (and ds4.c passes a NULL
+         * cache).  The 0 -> 1 crossing at a layer's first emit must force a
+         * recapture or replays read compressed rows from the wrong buffer
+         * (measured: every logit wrong from pos 128, the first odd-layer
+         * emit, while pos < 128 replays are bit-exact). */
+        DS4_STEP_SIG_MIX(n_comp != 0u ? 8u : 9u);
         if (ratio == 4u &&
             n_comp > sparse_threshold &&
             n_index_comp > DS4_N_INDEXER_TOP_K) {
