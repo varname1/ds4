@@ -6420,6 +6420,24 @@ void ds4_gpu_token_graph_layer_hint(uint32_t il) { (void)il; }
 int ds4_gpu_attention_decode_variant(uint32_t n_comp) { (void)n_comp; return 0; }
 uint32_t ds4_gpu_indexer_topk_bucket(uint32_t n_comp) { (void)n_comp; return 0; }
 
+/* Whole-chain HC pre fusion is a CUDA-only fast path; Metal keeps the
+ * existing rms_norm + mixer matmul + split/sum/norm encode sequence. */
+int ds4_gpu_hc_pre_norm_fused_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *norm_out,
+        ds4_gpu_tensor *split, ds4_gpu_tensor *mix,
+        const ds4_gpu_tensor *hc,
+        const void *model_map, uint64_t model_size,
+        uint64_t fn_weight_offset, uint64_t scale_offset,
+        uint64_t base_offset, uint64_t norm_weight_offset,
+        uint32_t n_embd, uint32_t n_hc, uint32_t sinkhorn_iters,
+        float eps, float norm_eps) {
+    (void)out; (void)norm_out; (void)split; (void)mix; (void)hc;
+    (void)model_map; (void)model_size; (void)fn_weight_offset;
+    (void)scale_offset; (void)base_offset; (void)norm_weight_offset;
+    (void)n_embd; (void)n_hc; (void)sinkhorn_iters; (void)eps; (void)norm_eps;
+    return 0;
+}
+
 int ds4_gpu_begin_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return 0;

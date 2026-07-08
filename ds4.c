@@ -14882,29 +14882,52 @@ static bool metal_graph_encode_decode_layer(
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
     } while (0)
-    if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
-                                                 hc_dim, mix_hc, g->flat_hc, 1);
     const bool fuse_hc_norm =
         DS4_N_HC == 4 &&
         !metal_graph_use_reference_hc_decode() &&
         !metal_graph_use_reference_hc_norm_decode();
+    bool hc_pre_chain_fused = false;
+    if (ok && fuse_hc_norm && layer->hc_attn_fn->type == DS4_TENSOR_F16) {
+        hc_pre_chain_fused = ds4_gpu_hc_pre_norm_fused_tensor(g->attn_cur,
+                                                              g->attn_norm,
+                                                              g->hc_split,
+                                                              g->hc_mix,
+                                                              g->cur_hc,
+                                                              model->map,
+                                                              model->size,
+                                                              layer->hc_attn_fn->abs_offset,
+                                                              layer->hc_attn_scale->abs_offset,
+                                                              layer->hc_attn_base->abs_offset,
+                                                              layer->attn_norm->abs_offset,
+                                                              DS4_N_EMBD,
+                                                              DS4_N_HC,
+                                                              DS4_N_HC_SINKHORN_ITER,
+                                                              DS4_HC_EPS,
+                                                              DS4_RMS_EPS) != 0;
+    }
+    if (ok && !hc_pre_chain_fused) {
+        ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+        if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
+                                                     hc_dim, mix_hc, g->flat_hc, 1);
+    }
     if (ok && fuse_hc_norm) {
-        ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->attn_cur,
-                                                         g->attn_norm,
-                                                         g->hc_split,
-                                                         g->hc_mix,
-                                                         g->cur_hc,
-                                                         model->map,
-                                                         model->size,
-                                                         layer->hc_attn_scale->abs_offset,
-                                                         layer->hc_attn_base->abs_offset,
-                                                         layer->attn_norm->abs_offset,
-                                                         DS4_N_EMBD,
-                                                         DS4_N_HC,
-                                                         DS4_N_HC_SINKHORN_ITER,
-                                                         DS4_HC_EPS,
-                                                         DS4_RMS_EPS) != 0;
+        if (!hc_pre_chain_fused) {
+            ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->attn_cur,
+                                                             g->attn_norm,
+                                                             g->hc_split,
+                                                             g->hc_mix,
+                                                             g->cur_hc,
+                                                             model->map,
+                                                             model->size,
+                                                             layer->hc_attn_scale->abs_offset,
+                                                             layer->hc_attn_base->abs_offset,
+                                                             layer->attn_norm->abs_offset,
+                                                             DS4_N_EMBD,
+                                                             DS4_N_HC,
+                                                             DS4_N_HC_SINKHORN_ITER,
+                                                             DS4_HC_EPS,
+                                                             DS4_RMS_EPS) != 0;
+        }
         if (ok) {
             ok = metal_graph_check_hc_norm_fusion("attn",
                                                   g->attn_cur,
@@ -15496,25 +15519,48 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
-                                                 hc_dim, mix_hc, g->flat_hc, 1);
+    hc_pre_chain_fused = false;
+    if (ok && fuse_hc_norm && layer->hc_ffn_fn->type == DS4_TENSOR_F16) {
+        hc_pre_chain_fused = ds4_gpu_hc_pre_norm_fused_tensor(g->ffn_cur,
+                                                              g->ffn_norm,
+                                                              g->hc_split,
+                                                              g->hc_mix,
+                                                              g->after_attn_hc,
+                                                              model->map,
+                                                              model->size,
+                                                              layer->hc_ffn_fn->abs_offset,
+                                                              layer->hc_ffn_scale->abs_offset,
+                                                              layer->hc_ffn_base->abs_offset,
+                                                              layer->ffn_norm->abs_offset,
+                                                              DS4_N_EMBD,
+                                                              DS4_N_HC,
+                                                              DS4_N_HC_SINKHORN_ITER,
+                                                              DS4_HC_EPS,
+                                                              DS4_RMS_EPS) != 0;
+    }
+    if (ok && !hc_pre_chain_fused) {
+        ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+        if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
+                                                     hc_dim, mix_hc, g->flat_hc, 1);
+    }
     if (ok && fuse_hc_norm) {
-        ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->ffn_cur,
-                                                         g->ffn_norm,
-                                                         g->hc_split,
-                                                         g->hc_mix,
-                                                         g->after_attn_hc,
-                                                         model->map,
-                                                         model->size,
-                                                         layer->hc_ffn_scale->abs_offset,
-                                                         layer->hc_ffn_base->abs_offset,
-                                                         layer->ffn_norm->abs_offset,
-                                                         DS4_N_EMBD,
-                                                         DS4_N_HC,
-                                                         DS4_N_HC_SINKHORN_ITER,
-                                                         DS4_HC_EPS,
-                                                         DS4_RMS_EPS) != 0;
+        if (!hc_pre_chain_fused) {
+            ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->ffn_cur,
+                                                             g->ffn_norm,
+                                                             g->hc_split,
+                                                             g->hc_mix,
+                                                             g->after_attn_hc,
+                                                             model->map,
+                                                             model->size,
+                                                             layer->hc_ffn_scale->abs_offset,
+                                                             layer->hc_ffn_base->abs_offset,
+                                                             layer->ffn_norm->abs_offset,
+                                                             DS4_N_EMBD,
+                                                             DS4_N_HC,
+                                                             DS4_N_HC_SINKHORN_ITER,
+                                                             DS4_HC_EPS,
+                                                             DS4_RMS_EPS) != 0;
+        }
         if (ok) {
             ok = metal_graph_check_hc_norm_fusion("ffn",
                                                   g->ffn_cur,
