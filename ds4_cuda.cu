@@ -90,6 +90,11 @@ static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
+
+/* Token-graph capture: lazy device (de)allocations invalidate an active
+ * stream capture, so every such site bumps an epoch the capture warmup
+ * watches (definition near ds4_gpu_token_capture_begin). */
+static void cuda_token_graph_note_device_alloc(void);
 static int g_quality_mode;
 static int g_ssd_streaming_mode;
 
@@ -254,6 +259,7 @@ __global__ static void dequant_q8_0_to_f32_kernel(
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
+    cuda_token_graph_note_device_alloc();
     if (g_cuda_tmp) {
         (void)cudaFree(g_cuda_tmp);
         g_cuda_tmp = NULL;
@@ -311,6 +317,7 @@ static const char *cuda_model_range_register_mapped(const void *model_map,
         flags = cudaHostRegisterMapped;
     }
 
+    cuda_token_graph_note_device_alloc();
     cudaError_t err = cudaHostRegister((void *)reg_addr,
                                        (size_t)reg_bytes,
                                        flags);
@@ -373,6 +380,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     }
 
     void *dev = NULL;
+    cuda_token_graph_note_device_alloc();
     cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
@@ -724,6 +732,7 @@ static const __half *cuda_q8_f16_ptr(
     if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) return NULL;
 
     __half *dev = NULL;
+    cuda_token_graph_note_device_alloc();
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA q8 fp16 cache alloc failed (%.2f MiB): %s\n",
@@ -776,6 +785,7 @@ static float *cuda_q8_f32_ptr(
 
     const uint64_t out_bytes = in_dim * out_dim * sizeof(float);
     float *dev = NULL;
+    cuda_token_graph_note_device_alloc();
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA q8 fp32 cache alloc failed (%.2f MiB): %s\n",
@@ -1191,6 +1201,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
 
     const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
     void *dev = NULL;
+    cuda_token_graph_note_device_alloc();
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s\n",
@@ -1788,6 +1799,7 @@ static int cuda_stream_selected_ensure_bytes(
         const char *what) {
     if (bytes == 0) return 1;
     if (*ptr && *capacity >= bytes) return 1;
+    cuda_token_graph_note_device_alloc();
     if (*ptr) {
         (void)cudaFree(*ptr);
         *ptr = NULL;
@@ -2283,6 +2295,10 @@ extern "C" int ds4_gpu_init(void) {
     }
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
+        /* All implicit kernel launches use the per-thread default stream
+         * (--default-stream per-thread, required for token-graph capture);
+         * cuBLAS must issue on the same stream to keep prefill ordering. */
+        if (!cublas_ok(cublasSetStream(g_cublas, cudaStreamPerThread), "set stream")) return 0;
         const cublasMath_t math_mode =
             (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
                 ? CUBLAS_DEFAULT_MATH
@@ -2370,6 +2386,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
+    cuda_token_graph_note_device_alloc();
     if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
         free(t);
         return NULL;
@@ -2440,7 +2457,10 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
 
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
-    if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
+    if (tensor->owner && tensor->ptr) {
+        cuda_token_graph_note_device_alloc();
+        (void)cudaFree(tensor->ptr);
+    }
     free(tensor);
 }
 
@@ -2519,6 +2539,146 @@ extern "C" int ds4_gpu_end_commands(void) {
 extern "C" int ds4_gpu_synchronize(void) {
     cuda_model_load_progress_finish();
     return cuda_ok(cudaDeviceSynchronize(), "synchronize");
+}
+
+/* ---- Single-token decode CUDA-graph capture (DS4_CUDA_GRAPH=1) ----
+ *
+ * The decode path issues ~2,400 tiny kernel launches per token (~87 GPU ops
+ * per layer x 43 layers).  On CUDA each launch costs ~5 us of CPU time, so
+ * decode is CPU launch-rate bound: the H200 finishes each micro-kernel long
+ * before the CPU can queue the next one (measured: routed MoE is ~4.4 ms of a
+ * ~28 ms token; CUDA_LAUNCH_BLOCKING=1 adds ~13.5 ms, i.e. ~2,400 syncs).
+ *
+ * Stream-capturing the whole token into a cudaGraph and launching it as one
+ * submission removes the per-launch driver round trips.  Because per-token
+ * scalars (token id, pos, raw_row, n_raw, per-layer n_comp) are baked into
+ * kernel args, we re-capture every token and refresh the cached executable
+ * with cudaGraphExecUpdate (cheap while the topology is stable); topology
+ * changes at context-size thresholds fall back to a re-instantiate.
+ *
+ * Requires every implicit launch to go to a capturable stream, so the build
+ * adds `--default-stream per-thread` (see Makefile); cuBLAS is pinned to
+ * cudaStreamPerThread at handle creation for prefill-path ordering.
+ *
+ * Safety: capture begins only after several consecutive tokens with no lazy
+ * device (de)allocations (cudaFree invalidates an active capture), and ANY
+ * capture failure returns 2 from ds4_gpu_token_capture_end so the caller
+ * re-runs the token through the normal path - a broken capture can never
+ * fail a request or corrupt state. */
+static cudaGraphExec_t g_token_graph_exec;
+static int      g_token_graph_env = -1;      /* -1 unknown, 0 off, 1 on */
+static int      g_token_graph_disabled;
+static int      g_token_graph_capturing;
+static uint32_t g_token_graph_retries;
+static uint64_t g_token_graph_launches;      /* graph-executed tokens, for logs */
+static uint64_t g_token_graph_alloc_epoch;   /* bumped by lazy device (de)allocs */
+static uint64_t g_token_graph_seen_epoch;
+static uint32_t g_token_graph_clean_tokens;  /* consecutive alloc-free tokens */
+
+static void cuda_token_graph_note_device_alloc(void) {
+    g_token_graph_alloc_epoch++;
+}
+
+extern "C" int ds4_gpu_token_capture_begin(void) {
+    if (g_token_graph_env == -1) {
+        const char *e = getenv("DS4_CUDA_GRAPH");
+        g_token_graph_env = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+        if (g_token_graph_env) {
+            fprintf(stderr, "ds4: CUDA token graph capture enabled (experimental)\n");
+        }
+    }
+    if (!g_token_graph_env || g_token_graph_disabled) return 0;
+
+    /* Cleanliness accounting: only capture once the lazy allocation paths
+     * (tmp buffers, weight range copies, q8 caches) have gone quiet. */
+    if (g_token_graph_seen_epoch == g_token_graph_alloc_epoch) {
+        if (g_token_graph_clean_tokens < 1000000u) g_token_graph_clean_tokens++;
+    } else {
+        g_token_graph_clean_tokens = 0;
+        g_token_graph_seen_epoch = g_token_graph_alloc_epoch;
+    }
+    if (g_token_graph_clean_tokens < 4u) return 0;
+
+    cudaError_t err = cudaStreamBeginCapture(cudaStreamPerThread,
+                                             cudaStreamCaptureModeThreadLocal);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: CUDA token graph capture begin failed: %s (disabled)\n",
+                cudaGetErrorString(err));
+        g_token_graph_disabled = 1;
+        return 0;
+    }
+    g_token_graph_capturing = 1;
+    return 1;
+}
+
+static int cuda_token_graph_abandon(cudaGraph_t graph, const char *why, cudaError_t err) {
+    (void)cudaGetLastError();
+    if (graph) (void)cudaGraphDestroy(graph);
+    g_token_graph_clean_tokens = 0;
+    if (++g_token_graph_retries > 64u && !g_token_graph_disabled) {
+        fprintf(stderr,
+                "ds4: CUDA token graph disabled after %u abandoned captures (last: %s: %s)\n",
+                g_token_graph_retries, why ? why : "?",
+                err != cudaSuccess ? cudaGetErrorString(err) : "encode failed");
+        g_token_graph_disabled = 1;
+    }
+    return 2;
+}
+
+extern "C" int ds4_gpu_token_capture_end(int encode_ok) {
+    if (!g_token_graph_capturing) return 2;
+    g_token_graph_capturing = 0;
+
+    cudaGraph_t graph = NULL;
+    cudaError_t err = cudaStreamEndCapture(cudaStreamPerThread, &graph);
+    if (err != cudaSuccess || graph == NULL || !encode_ok) {
+        /* Includes cudaErrorStreamCaptureInvalidated (a lazy alloc/free or
+         * sync API ran mid-capture).  An encode failure during capture is
+         * ambiguous - it may itself be capture-induced - so ALWAYS hand the
+         * token back to the normal path; a real encode error will reproduce
+         * there with proper semantics. */
+        return cuda_token_graph_abandon(graph, "end capture", err);
+    }
+
+    if (g_token_graph_exec) {
+        cudaGraphExecUpdateResultInfo update_info;
+        memset(&update_info, 0, sizeof(update_info));
+        err = cudaGraphExecUpdate(g_token_graph_exec, graph, &update_info);
+        if (err != cudaSuccess) {
+            /* Topology changed (context-size threshold crossed a kernel
+             * variant boundary) - rebuild the executable. */
+            (void)cudaGetLastError();
+            (void)cudaGraphExecDestroy(g_token_graph_exec);
+            g_token_graph_exec = NULL;
+        }
+    }
+    if (g_token_graph_exec == NULL) {
+        err = cudaGraphInstantiate(&g_token_graph_exec, graph, 0);
+        if (err != cudaSuccess || g_token_graph_exec == NULL) {
+            g_token_graph_exec = NULL;
+            return cuda_token_graph_abandon(graph, "instantiate", err);
+        }
+        if (g_token_graph_launches == 0) {
+            size_t n_nodes = 0;
+            (void)cudaGraphGetNodes(graph, NULL, &n_nodes);
+            fprintf(stderr, "ds4: CUDA token graph instantiated (%zu nodes)\n", n_nodes);
+        }
+    }
+    (void)cudaGraphDestroy(graph);
+
+    err = cudaGraphLaunch(g_token_graph_exec, cudaStreamPerThread);
+    if (err != cudaSuccess) {
+        /* Nothing ran; the exec may be stale - drop it and retry uncaptured. */
+        (void)cudaGetLastError();
+        (void)cudaGraphExecDestroy(g_token_graph_exec);
+        g_token_graph_exec = NULL;
+        return cuda_token_graph_abandon(NULL, "launch", err);
+    }
+    g_token_graph_retries = 0;
+    g_token_graph_launches++;
+    if (!cuda_ok(cudaDeviceSynchronize(), "token graph execute")) return 0;
+    return 1;
 }
 
 static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
@@ -12440,7 +12600,7 @@ static int routed_moe_launch(
                 tile16_total = use_down_tile16 ? (uint32_t *)(scratch + tile16_total_off) : NULL;
                 tile16_experts = use_down_tile16 ? (uint32_t *)(scratch + tile16_experts_off) : NULL;
                 tile16_starts = use_down_tile16 ? (uint32_t *)(scratch + tile16_starts_off) : NULL;
-                ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "routed_moe sorted counts clear");
+                ok = cuda_ok(cudaMemsetAsync(counts, 0, counts_bytes, cudaStreamPerThread), "routed_moe sorted counts clear");
                 if (ok) {
                     moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
                         counts,

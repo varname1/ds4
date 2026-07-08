@@ -54,6 +54,20 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* Single-token decode graph capture (CUDA: opt-in via DS4_CUDA_GRAPH=1;
+ * Metal/ROCm: pass-through to begin/end_commands).
+ * ds4_gpu_token_capture_begin() returns 1 when the caller's subsequent ops are
+ * being captured (the caller must then finish with ds4_gpu_token_capture_end),
+ * or 0 for the normal begin_commands path (the backend already ran
+ * begin_commands in that case).
+ * ds4_gpu_token_capture_end(encode_ok) returns:
+ *   1 - token executed via the captured graph (synced, results ready)
+ *   2 - capture was abandoned; NOTHING ran - the caller must re-run the
+ *       token through the normal begin/encode/end path
+ *   0 - hard execution error after a successful launch */
+int ds4_gpu_token_capture_begin(void);
+int ds4_gpu_token_capture_end(int encode_ok);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);

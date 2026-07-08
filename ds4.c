@@ -19473,10 +19473,43 @@ static bool metal_graph_eval_token_raw_swa(
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
 
-    bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+    /* Token-graph fast path (CUDA, DS4_CUDA_GRAPH=1): capture the encoded
+     * token into a CUDA graph and submit it in one launch instead of ~2,400
+     * individual kernel launches.  A return of 2 from capture_end means the
+     * capture was abandoned and NOTHING ran (e.g. a lazy allocation happened
+     * mid-capture) - the token transparently re-runs on the normal path. */
+    bool ok = false;
+    bool executed = false;
+    if (ds4_gpu_token_capture_begin() == 1) {
+        /* Encode mutates the per-layer compressor emit counters; snapshot
+         * them so an abandoned capture can re-encode from identical state.
+         * allow_split_flush=false: the mid-encode flush is a device sync,
+         * which would invalidate the capture (the single-launch graph
+         * supersedes that latency trick anyway). */
+        uint32_t saved_n_comp[DS4_MAX_LAYER];
+        uint32_t saved_n_index_comp[DS4_MAX_LAYER];
+        ds4_gpu_tensor *saved_cur_hc = g->cur_hc;
+        ds4_gpu_tensor *saved_after_ffn_hc = g->after_ffn_hc;
+        memcpy(saved_n_comp, g->layer_n_comp, sizeof(saved_n_comp));
+        memcpy(saved_n_index_comp, g->layer_n_index_comp, sizeof(saved_n_index_comp));
+        ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, false);
+        const int fin = ds4_gpu_token_capture_end(ok ? 1 : 0);
+        if (fin != 2) {
+            executed = true;
+            ok = ok && fin == 1;
+        } else {
+            memcpy(g->layer_n_comp, saved_n_comp, sizeof(saved_n_comp));
+            memcpy(g->layer_n_index_comp, saved_n_index_comp, sizeof(saved_n_index_comp));
+            g->cur_hc = saved_cur_hc;
+            g->after_ffn_hc = saved_after_ffn_hc;
+        }
+    }
     const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
-    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (!executed) {
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+    }
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
     if (ok && logits) {
