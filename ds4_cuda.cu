@@ -90,6 +90,11 @@ static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
+
+/* Token-graph capture: lazy device (de)allocations invalidate an active
+ * stream capture, so every such site bumps an epoch the capture warmup
+ * watches (definition near ds4_gpu_token_capture_begin). */
+static void cuda_token_graph_note_device_alloc(void);
 static int g_quality_mode;
 static int g_ssd_streaming_mode;
 
@@ -254,6 +259,7 @@ __global__ static void dequant_q8_0_to_f32_kernel(
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
+    cuda_token_graph_note_device_alloc();
     if (g_cuda_tmp) {
         (void)cudaFree(g_cuda_tmp);
         g_cuda_tmp = NULL;
@@ -311,6 +317,7 @@ static const char *cuda_model_range_register_mapped(const void *model_map,
         flags = cudaHostRegisterMapped;
     }
 
+    cuda_token_graph_note_device_alloc();
     cudaError_t err = cudaHostRegister((void *)reg_addr,
                                        (size_t)reg_bytes,
                                        flags);
@@ -373,6 +380,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     }
 
     void *dev = NULL;
+    cuda_token_graph_note_device_alloc();
     cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
@@ -724,6 +732,7 @@ static const __half *cuda_q8_f16_ptr(
     if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) return NULL;
 
     __half *dev = NULL;
+    cuda_token_graph_note_device_alloc();
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA q8 fp16 cache alloc failed (%.2f MiB): %s\n",
@@ -776,6 +785,7 @@ static float *cuda_q8_f32_ptr(
 
     const uint64_t out_bytes = in_dim * out_dim * sizeof(float);
     float *dev = NULL;
+    cuda_token_graph_note_device_alloc();
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA q8 fp32 cache alloc failed (%.2f MiB): %s\n",
@@ -1191,6 +1201,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
 
     const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
     void *dev = NULL;
+    cuda_token_graph_note_device_alloc();
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s\n",
@@ -1788,6 +1799,7 @@ static int cuda_stream_selected_ensure_bytes(
         const char *what) {
     if (bytes == 0) return 1;
     if (*ptr && *capacity >= bytes) return 1;
+    cuda_token_graph_note_device_alloc();
     if (*ptr) {
         (void)cudaFree(*ptr);
         *ptr = NULL;
@@ -2283,6 +2295,10 @@ extern "C" int ds4_gpu_init(void) {
     }
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
+        /* All implicit kernel launches use the per-thread default stream
+         * (--default-stream per-thread, required for token-graph capture);
+         * cuBLAS must issue on the same stream to keep prefill ordering. */
+        if (!cublas_ok(cublasSetStream(g_cublas, cudaStreamPerThread), "set stream")) return 0;
         const cublasMath_t math_mode =
             (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
                 ? CUBLAS_DEFAULT_MATH
@@ -2370,6 +2386,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
+    cuda_token_graph_note_device_alloc();
     if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
         free(t);
         return NULL;
@@ -2440,7 +2457,10 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
 
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
-    if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
+    if (tensor->owner && tensor->ptr) {
+        cuda_token_graph_note_device_alloc();
+        (void)cudaFree(tensor->ptr);
+    }
     free(tensor);
 }
 
@@ -2519,6 +2539,308 @@ extern "C" int ds4_gpu_end_commands(void) {
 extern "C" int ds4_gpu_synchronize(void) {
     cuda_model_load_progress_finish();
     return cuda_ok(cudaDeviceSynchronize(), "synchronize");
+}
+
+/* ---- Single-token decode CUDA-graph capture (DS4_CUDA_GRAPH=1) ----
+ *
+ * The decode path issues ~2,400 tiny kernel launches per token (~87 GPU ops
+ * per layer x 43 layers).  On CUDA each launch costs ~5 us of CPU time, so
+ * decode is CPU launch-rate bound: the H200 finishes each micro-kernel long
+ * before the CPU can queue the next one (measured: routed MoE is ~4.4 ms of a
+ * ~28 ms token; CUDA_LAUNCH_BLOCKING=1 adds ~13.5 ms, i.e. ~2,400 syncs).
+ *
+ * Stream-capturing the whole token into a cudaGraph and launching it as one
+ * submission removes the per-launch driver round trips.  Because per-token
+ * scalars (token id, pos, raw_row, n_raw, per-layer n_comp) are baked into
+ * kernel args, we re-capture every token and refresh the cached executable
+ * with cudaGraphExecUpdate (cheap while the topology is stable); topology
+ * changes at context-size thresholds fall back to a re-instantiate.
+ *
+ * Requires every implicit launch to go to a capturable stream, so the build
+ * adds `--default-stream per-thread` (see Makefile); cuBLAS is pinned to
+ * cudaStreamPerThread at handle creation for prefill-path ordering.
+ *
+ * Safety: capture begins only after several consecutive tokens with no lazy
+ * device (de)allocations (cudaFree invalidates an active capture), and ANY
+ * capture failure returns 2 from ds4_gpu_token_capture_end so the caller
+ * re-runs the token through the normal path - a broken capture can never
+ * fail a request or corrupt state. */
+static cudaGraphExec_t g_token_graph_exec;
+static int      g_token_graph_env = -1;      /* -1 unknown, 0 off, 1 on */
+static int      g_token_graph_force = 0;     /* DS4_CUDA_GRAPH_FORCE_CAPTURE: Stage-1 behavior */
+static int      g_token_graph_disabled;
+static int      g_token_graph_capturing;
+static uint32_t g_token_graph_retries;
+static uint64_t g_token_graph_launches;      /* graph-executed tokens, for logs */
+static uint64_t g_token_graph_alloc_epoch;   /* bumped by lazy device (de)allocs */
+static uint64_t g_token_graph_seen_epoch;
+static uint32_t g_token_graph_clean_tokens;  /* consecutive alloc-free tokens */
+
+/* Stage-2 replay state.  The pinned step-state block is the host source of a
+ * memcpy-to-symbol node captured as the FIRST op of every step-mode graph;
+ * memcpy nodes re-read host memory on every launch, so refreshing the pinned
+ * block is all a replayed token needs. */
+__device__ ds4_gpu_step_state g_step_state_dev;
+static ds4_gpu_step_state *g_step_state_host;      /* pinned; NULL = replay off */
+static int      g_step_state_host_failed;
+static int      g_token_graph_step_mode;           /* capture uses STEP kernels */
+static int      g_token_graph_step_impure;         /* a scalar-consuming launch was not STEP-able */
+static int      g_token_graph_replayable;          /* cached exec is a valid step-mode graph */
+static uint64_t g_token_graph_sig;                 /* variant signature at capture */
+static uint64_t g_token_graph_capture_epoch;       /* alloc epoch at capture */
+static uint64_t g_token_graph_replays;             /* replayed tokens, for logs */
+static uint32_t g_token_graph_layer_hint_v;
+
+/* True while the encode is being stream-captured in step mode: launch
+ * wrappers must select the STEP=true kernel instantiations. */
+static inline int cuda_token_graph_step_capturing(void) {
+    return g_token_graph_capturing && g_token_graph_step_mode;
+}
+
+/* A wrapper is about to bake a per-token scalar into a non-STEP kernel
+ * variant while a step-mode capture is active: the resulting exec must never
+ * be replayed (its baked value would go stale). */
+static void cuda_token_graph_mark_step_impure(const char *what) {
+    if (cuda_token_graph_step_capturing() && !g_token_graph_step_impure) {
+        g_token_graph_step_impure = 1;
+        fprintf(stderr, "ds4: CUDA token graph: %s is not replay-safe; replay disabled for this capture\n",
+                what);
+    }
+}
+
+static void cuda_token_graph_note_device_alloc(void) {
+    g_token_graph_alloc_epoch++;
+}
+
+extern "C" void ds4_gpu_token_graph_layer_hint(uint32_t il) {
+    g_token_graph_layer_hint_v = il;
+}
+
+extern "C" ds4_gpu_step_state *ds4_gpu_token_step_state(void) {
+    if (!g_step_state_host && !g_step_state_host_failed) {
+        void *p = NULL;
+        cudaError_t err = cudaMallocHost(&p, sizeof(ds4_gpu_step_state));
+        if (err != cudaSuccess || !p) {
+            (void)cudaGetLastError();
+            fprintf(stderr, "ds4: CUDA token graph pinned step-state alloc failed: %s (replay disabled)\n",
+                    cudaGetErrorString(err));
+            g_step_state_host_failed = 1;
+            return NULL;
+        }
+        memset(p, 0, sizeof(ds4_gpu_step_state));
+        g_step_state_host = (ds4_gpu_step_state *)p;
+    }
+    return g_step_state_host;
+}
+
+static void cuda_token_graph_drop_exec(void) {
+    if (g_token_graph_exec) {
+        (void)cudaGraphExecDestroy(g_token_graph_exec);
+        g_token_graph_exec = NULL;
+    }
+    g_token_graph_replayable = 0;
+}
+
+extern "C" int ds4_gpu_token_capture_begin(uint64_t sig, int replay_ok) {
+    if (g_token_graph_env == -1) {
+        const char *e = getenv("DS4_CUDA_GRAPH");
+        g_token_graph_env = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+        const char *f = getenv("DS4_CUDA_GRAPH_FORCE_CAPTURE");
+        g_token_graph_force = (f && f[0] && strcmp(f, "0") != 0) ? 1 : 0;
+        if (g_token_graph_env) {
+            fprintf(stderr, "ds4: CUDA token graph enabled (%s)\n",
+                    g_token_graph_force ? "capture every token" : "capture + replay");
+        }
+    }
+    if (!g_token_graph_env || g_token_graph_disabled) return 0;
+
+    /* Stage-1 comparator / exactness harness: re-capture every token, never
+     * replay, kernels keep their baked args (byte-identical Stage-1). */
+    if (g_token_graph_force) replay_ok = 0;
+
+    /* Tokens whose topology differs from the plain non-emit decode token
+     * (compressor emits) run the normal path: they are ~25% of tokens and
+     * the overlapped launch-per-op path is faster than a capture+execute. */
+    if (!g_token_graph_force && !replay_ok) return 0;
+
+    /* Replay: same variant signature, no device (de)allocation since capture
+     * (lazy allocs invalidate baked pointers, e.g. cuda_tmp in the indexed
+     * attention path).  The pinned step state was refreshed by the caller;
+     * the graph's leading memcpy node re-reads it on launch. */
+    if (replay_ok && g_token_graph_replayable && g_token_graph_exec &&
+        sig == g_token_graph_sig &&
+        g_token_graph_alloc_epoch == g_token_graph_capture_epoch) {
+        cudaError_t err = cudaGraphLaunch(g_token_graph_exec, cudaStreamPerThread);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            fprintf(stderr, "ds4: CUDA token graph replay launch failed: %s (recapturing)\n",
+                    cudaGetErrorString(err));
+            cuda_token_graph_drop_exec();
+            /* Nothing ran; fall through to the capture/normal path below. */
+        } else {
+            g_token_graph_replays++;
+            if (g_token_graph_replays == 1 || (g_token_graph_replays & 1023u) == 0) {
+                fprintf(stderr, "ds4: CUDA token graph replay stats: %llu replays, %llu captures\n",
+                        (unsigned long long)g_token_graph_replays,
+                        (unsigned long long)g_token_graph_launches);
+            }
+            if (!cuda_ok(cudaDeviceSynchronize(), "token graph replay")) return 4;
+            return 3;
+        }
+    }
+
+    /* Cleanliness accounting: only capture once the lazy allocation paths
+     * (tmp buffers, weight range copies, q8 caches) have gone quiet. */
+    if (g_token_graph_seen_epoch == g_token_graph_alloc_epoch) {
+        if (g_token_graph_clean_tokens < 1000000u) g_token_graph_clean_tokens++;
+    } else {
+        g_token_graph_clean_tokens = 0;
+        g_token_graph_seen_epoch = g_token_graph_alloc_epoch;
+    }
+    if (g_token_graph_clean_tokens < 4u) return 0;
+
+    const int step_mode = !g_token_graph_force && g_step_state_host != NULL;
+
+    cudaError_t err = cudaStreamBeginCapture(cudaStreamPerThread,
+                                             cudaStreamCaptureModeThreadLocal);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: CUDA token graph capture begin failed: %s (disabled)\n",
+                cudaGetErrorString(err));
+        g_token_graph_disabled = 1;
+        return 0;
+    }
+    if (step_mode) {
+        /* First node: refresh the device step state from the pinned block.
+         * STEP kernels read the symbol instead of their baked args, so this
+         * same exec replays correctly for future tokens. */
+        err = cudaMemcpyToSymbolAsync(g_step_state_dev, g_step_state_host,
+                                      sizeof(ds4_gpu_step_state), 0,
+                                      cudaMemcpyHostToDevice, cudaStreamPerThread);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            cudaGraph_t graph = NULL;
+            (void)cudaStreamEndCapture(cudaStreamPerThread, &graph);
+            if (graph) (void)cudaGraphDestroy(graph);
+            fprintf(stderr, "ds4: CUDA token graph step-state memcpy capture failed: %s\n",
+                    cudaGetErrorString(err));
+            g_token_graph_clean_tokens = 0;
+            return 0;
+        }
+    }
+    g_token_graph_capturing = 1;
+    g_token_graph_step_mode = step_mode;
+    g_token_graph_step_impure = 0;
+    return 1;
+}
+
+static int cuda_token_graph_abandon(cudaGraph_t graph, const char *why, cudaError_t err) {
+    (void)cudaGetLastError();
+    if (graph) (void)cudaGraphDestroy(graph);
+    g_token_graph_clean_tokens = 0;
+    if (++g_token_graph_retries > 64u && !g_token_graph_disabled) {
+        fprintf(stderr,
+                "ds4: CUDA token graph disabled after %u abandoned captures (last: %s: %s)\n",
+                g_token_graph_retries, why ? why : "?",
+                err != cudaSuccess ? cudaGetErrorString(err) : "encode failed");
+        g_token_graph_disabled = 1;
+    }
+    return 2;
+}
+
+extern "C" int ds4_gpu_token_capture_end(int encode_ok, uint64_t sig) {
+    if (!g_token_graph_capturing) return 2;
+    g_token_graph_capturing = 0;
+    const int step_mode = g_token_graph_step_mode;
+    g_token_graph_step_mode = 0;
+
+    cudaGraph_t graph = NULL;
+    cudaError_t err = cudaStreamEndCapture(cudaStreamPerThread, &graph);
+    if (err != cudaSuccess || graph == NULL || !encode_ok) {
+        /* Includes cudaErrorStreamCaptureInvalidated (a lazy alloc/free or
+         * sync API ran mid-capture).  An encode failure during capture is
+         * ambiguous - it may itself be capture-induced - so ALWAYS hand the
+         * token back to the normal path; a real encode error will reproduce
+         * there with proper semantics. */
+        g_token_graph_replayable = 0;
+        return cuda_token_graph_abandon(graph, "end capture", err);
+    }
+
+    if (g_token_graph_exec) {
+        cudaGraphExecUpdateResultInfo update_info;
+        memset(&update_info, 0, sizeof(update_info));
+        err = cudaGraphExecUpdate(g_token_graph_exec, graph, &update_info);
+        if (err != cudaSuccess) {
+            /* Topology changed (context-size threshold crossed a kernel
+             * variant boundary) - rebuild the executable. */
+            (void)cudaGetLastError();
+            (void)cudaGraphExecDestroy(g_token_graph_exec);
+            g_token_graph_exec = NULL;
+        }
+    }
+    if (g_token_graph_exec == NULL) {
+        err = cudaGraphInstantiate(&g_token_graph_exec, graph, 0);
+        if (err != cudaSuccess || g_token_graph_exec == NULL) {
+            g_token_graph_exec = NULL;
+            g_token_graph_replayable = 0;
+            return cuda_token_graph_abandon(graph, "instantiate", err);
+        }
+        if (g_token_graph_launches == 0) {
+            size_t n_nodes = 0;
+            (void)cudaGraphGetNodes(graph, NULL, &n_nodes);
+            fprintf(stderr, "ds4: CUDA token graph instantiated (%zu nodes)\n", n_nodes);
+        }
+    }
+    (void)cudaGraphDestroy(graph);
+
+    err = cudaGraphLaunch(g_token_graph_exec, cudaStreamPerThread);
+    if (err != cudaSuccess) {
+        /* Nothing ran; the exec may be stale - drop it and retry uncaptured. */
+        (void)cudaGetLastError();
+        cuda_token_graph_drop_exec();
+        return cuda_token_graph_abandon(NULL, "launch", err);
+    }
+    /* The exec is a valid step-mode graph for this signature: future non-emit
+     * tokens with the same signature and alloc epoch replay it directly. */
+    g_token_graph_replayable = step_mode && !g_token_graph_step_impure;
+    g_token_graph_sig = sig;
+    g_token_graph_capture_epoch = g_token_graph_alloc_epoch;
+    g_token_graph_retries = 0;
+    g_token_graph_launches++;
+    if (!cuda_ok(cudaDeviceSynchronize(), "token graph execute")) return 0;
+    return 1;
+}
+
+/* Signature helpers: expose the SAME predicates the launch wrappers below use
+ * to pick kernel variants/grids from per-token counters, so the host-side
+ * replay signature cannot drift from the actual launch decisions. */
+extern "C" int ds4_gpu_attention_decode_variant(uint32_t n_comp) {
+    if (cuda_attention_score_buffer_fits(n_comp)) return 1;
+    if (getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) return 2;
+    return 0;
+}
+
+/* Top-k variant bucket for decode (top_k == 512, n_tokens == 1); also the
+ * grid pad for indexer_score_one_direct (blocks beyond the live n_comp exit
+ * immediately).  0 = chunked path: n_comp-dependent grids + tmp allocs, not
+ * replayable. */
+extern "C" uint32_t ds4_gpu_indexer_topk_bucket(uint32_t n_comp) {
+    if (n_comp <= 1024u && getenv("DS4_CUDA_NO_TOPK1024") == NULL) return 1024u;
+    if (getenv("DS4_CUDA_NO_TOPK2048") != NULL) return 0u;
+    if (n_comp <= 2048u) return 2048u;
+    if (n_comp <= 4096u) {
+        /* == 4096 picks the cub kernel, below it the pow2 sort: same grid,
+         * different kernel node - split the bucket at the boundary. */
+        return n_comp == 4096u ? 4097u : 4096u;
+    }
+    if (n_comp <= 8192u && getenv("DS4_CUDA_NO_TOPK8192") == NULL) return 8192u;
+    return 0u;
+}
+
+static uint32_t cuda_indexer_score_grid_pad(uint32_t n_comp) {
+    const uint32_t bucket = ds4_gpu_indexer_topk_bucket(n_comp);
+    if (bucket == 4097u) return 4096u;
+    return bucket ? bucket : n_comp;
 }
 
 static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
@@ -3365,7 +3687,9 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
     return 1;
 }
 
-__global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
+template <bool STEP>
+__global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token_arg, uint32_t n_embd, uint32_t n_hc) {
+    const uint32_t token = STEP ? g_step_state_dev.token : token_arg;
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
     if (i >= n) return;
@@ -4050,13 +4374,14 @@ __global__ static void head_rms_norm_kernel(float *x, uint32_t n_tok, uint32_t n
 
 __device__ static float rope_yarn_ramp_dev(float low, float high, int i0);
 
+template <bool STEP>
 __global__ static void head_rms_norm_rope_tail_kernel(
         float *x,
         uint32_t n_tok,
         uint32_t n_head,
         uint32_t head_dim,
         uint32_t n_rot,
-        uint32_t pos0,
+        uint32_t pos0_arg,
         uint32_t n_ctx_orig,
         int inverse,
         float freq_base,
@@ -4066,6 +4391,7 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         float beta_fast,
         float beta_slow,
         float eps) {
+    const uint32_t pos0 = STEP ? g_step_state_dev.pos : pos0_arg;
     uint32_t row = blockIdx.x;
     if (row >= n_tok * n_head) return;
     uint32_t t = row / n_head;
@@ -4123,13 +4449,14 @@ __device__ static float rope_yarn_ramp_dev(float low, float high, int i0) {
     return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
 }
 
+template <bool STEP>
 __global__ static void rope_tail_kernel(
         float *x,
         uint32_t n_tok,
         uint32_t n_head,
         uint32_t head_dim,
         uint32_t n_rot,
-        uint32_t pos0,
+        uint32_t pos0_arg,
         uint32_t pos_stride,
         uint32_t n_ctx_orig,
         int inverse,
@@ -4139,6 +4466,7 @@ __global__ static void rope_tail_kernel(
         float attn_factor,
         float beta_fast,
         float beta_slow) {
+    const uint32_t pos0 = STEP ? g_step_state_dev.pos : pos0_arg;
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
     if (gid >= pairs) return;
@@ -4335,7 +4663,10 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, ui
     xr[tid] = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, v / scale))) * scale;
 }
 
-__global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
+template <bool STEP>
+__global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0_arg, uint32_t n_tokens, uint32_t head_dim) {
+    /* STEP: single-token decode store - pos0 is the raw ring slot. */
+    const uint32_t pos0 = STEP ? g_step_state_dev.raw_row : pos0_arg;
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * head_dim;
     if (gid >= n) return;
@@ -4648,6 +4979,7 @@ __global__ static void attention_unpack_group_low_kernel(
     low[(uint64_t)t * low_dim + (uint64_t)g * rank + r] = tmp[gid];
 }
 
+template <bool STEP>
 __global__ static void attention_decode_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -4658,14 +4990,18 @@ __global__ static void attention_decode_mixed_kernel(
         uint32_t use_comp_mask,
         uint32_t n_tokens,
         uint32_t pos0,
-        uint32_t n_raw,
+        uint32_t n_raw_arg,
         uint32_t raw_cap,
-        uint32_t raw_start,
-        uint32_t n_comp,
+        uint32_t raw_start_arg,
+        uint32_t n_comp_arg,
+        uint32_t step_il,
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim) {
+    const uint32_t n_raw = STEP ? g_step_state_dev.n_raw : n_raw_arg;
+    const uint32_t raw_start = STEP ? g_step_state_dev.raw_start : raw_start_arg;
+    const uint32_t n_comp = STEP ? g_step_state_dev.n_comp[step_il] : n_comp_arg;
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
@@ -4816,6 +5152,7 @@ __global__ static void attention_decode_mixed_kernel(
     }
 }
 
+template <bool STEP>
 __global__ static void attention_indexed_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -4824,16 +5161,21 @@ __global__ static void attention_indexed_mixed_kernel(
         const float *comp_kv,
         const int32_t *topk,
         uint32_t n_tokens,
-        uint32_t pos0,
-        uint32_t n_raw,
+        uint32_t pos0_arg,
+        uint32_t n_raw_arg,
         uint32_t raw_cap,
-        uint32_t raw_start,
-        uint32_t n_comp,
+        uint32_t raw_start_arg,
+        uint32_t n_comp_arg,
+        uint32_t step_il,
         uint32_t top_k,
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim) {
+    const uint32_t pos0 = STEP ? g_step_state_dev.pos : pos0_arg;
+    const uint32_t n_raw = STEP ? g_step_state_dev.n_raw : n_raw_arg;
+    const uint32_t raw_start = STEP ? g_step_state_dev.raw_start : raw_start_arg;
+    const uint32_t n_comp = STEP ? g_step_state_dev.n_comp[step_il] : n_comp_arg;
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
@@ -5441,6 +5783,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     }
 }
 
+template <bool STEP>
 __global__ static void attention_decode_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
@@ -5449,14 +5792,18 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         const float *comp_kv,
         uint32_t n_tokens,
         uint32_t pos0,
-        uint32_t n_raw,
+        uint32_t n_raw_arg,
         uint32_t raw_cap,
-        uint32_t raw_start,
-        uint32_t n_comp,
+        uint32_t raw_start_arg,
+        uint32_t n_comp_arg,
+        uint32_t step_il,
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim) {
+    const uint32_t n_raw = STEP ? g_step_state_dev.n_raw : n_raw_arg;
+    const uint32_t raw_start = STEP ? g_step_state_dev.raw_start : raw_start_arg;
+    const uint32_t n_comp = STEP ? g_step_state_dev.n_comp[step_il] : n_comp_arg;
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -5802,6 +6149,7 @@ __global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
     if (i < n) x[i] = v;
 }
 
+template <bool STEP>
 __global__ static void compressor_store_kernel(
         const float *kv,
         const float *sc,
@@ -5812,8 +6160,9 @@ __global__ static void compressor_store_kernel(
         uint32_t ape_type,
         uint32_t head_dim,
         uint32_t ratio,
-        uint32_t pos0,
+        uint32_t pos0_arg,
         uint32_t n_tokens) {
+    const uint32_t pos0 = STEP ? g_step_state_dev.pos : pos0_arg;
     uint32_t coff = ratio == 4u ? 2u : 1u;
     uint32_t width = coff * head_dim;
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -5981,6 +6330,7 @@ __device__ static float softplus_dev(float x) {
     return log1pf(expf(x));
 }
 
+template <bool STEP>
 __global__ static void router_select_kernel(
         int32_t *selected,
         float *weights,
@@ -5989,11 +6339,12 @@ __global__ static void router_select_kernel(
         const int32_t *hash,
         const float *logits,
         const int32_t *tokens,
-        int32_t token_scalar,
+        int32_t token_scalar_arg,
         uint32_t hash_rows,
         uint32_t n_tokens,
         int has_bias,
         int hash_mode) {
+    const int32_t token_scalar = STEP ? (int32_t)g_step_state_dev.token : token_scalar_arg;
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
     const float *log = logits + (uint64_t)t * 256;
@@ -6033,6 +6384,7 @@ __global__ static void router_select_kernel(
     for (int i = 0; i < 6; i++) w[i] = w[i] / sum * 1.5f;
 }
 
+template <bool STEP>
 __global__ static void router_select_parallel_kernel(
         int32_t *selected,
         float *weights,
@@ -6041,11 +6393,12 @@ __global__ static void router_select_parallel_kernel(
         const int32_t *hash,
         const float *logits,
         const int32_t *tokens,
-        int32_t token_scalar,
+        int32_t token_scalar_arg,
         uint32_t hash_rows,
         uint32_t n_tokens,
         int has_bias,
         int hash_mode) {
+    const int32_t token_scalar = STEP ? (int32_t)g_step_state_dev.token : token_scalar_arg;
     uint32_t t = blockIdx.x;
     uint32_t i = threadIdx.x;
     if (t >= n_tokens || i >= 256u) return;
@@ -6095,6 +6448,7 @@ __device__ __forceinline__ static bool router_score_better(float av, uint32_t ai
     return av > bv || (av == bv && ai < bi);
 }
 
+template <bool STEP>
 __global__ static void router_select_warp_topk_kernel(
         int32_t *selected,
         float *weights,
@@ -6103,11 +6457,12 @@ __global__ static void router_select_warp_topk_kernel(
         const int32_t *hash,
         const float *logits,
         const int32_t *tokens,
-        int32_t token_scalar,
+        int32_t token_scalar_arg,
         uint32_t hash_rows,
         uint32_t n_tokens,
         int has_bias,
         int hash_mode) {
+    const int32_t token_scalar = STEP ? (int32_t)g_step_state_dev.token : token_scalar_arg;
     const uint32_t lane = threadIdx.x;
     const uint32_t row_in_block = threadIdx.y;
     const uint32_t t = blockIdx.x * blockDim.y + row_in_block;
@@ -6303,16 +6658,19 @@ __global__ static void indexer_scores_kernel(
     if (threadIdx.x == 0) scores[(uint64_t)t * n_comp + c] = total * scale;
 }
 
+template <bool STEP>
 __global__ static void indexer_score_one_direct_kernel(
         float *scores,
         const float *q,
         const float *weights,
         const float *index_comp,
-        uint32_t n_comp,
+        uint32_t n_comp_arg,
+        uint32_t step_il,
         uint32_t pos0,
         uint32_t ratio,
         float scale,
         int causal) {
+    const uint32_t n_comp = STEP ? g_step_state_dev.n_index_comp[step_il] : n_comp_arg;
     const uint32_t c = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -6885,12 +7243,15 @@ __device__ __forceinline__ static uint64_t topk_pack_key(float v, uint32_t idx) 
     return ((uint64_t)topk_float_ordered_key(v) << 32u) | (uint64_t)(0xffffffffu - idx);
 }
 
+template <bool STEP>
 __global__ static void indexer_topk_8192_cub_kernel(
         uint32_t *selected,
         const float *scores,
-        uint32_t n_comp,
+        uint32_t n_comp_arg,
+        uint32_t step_il,
         uint32_t n_tokens,
         uint32_t top_k) {
+    const uint32_t n_comp = STEP ? g_step_state_dev.n_index_comp[step_il] : n_comp_arg;
     constexpr uint32_t BLOCK_THREADS = 512u;
     constexpr uint32_t ITEMS_PER_THREAD = 16u;
     using BlockSort = cub::BlockRadixSort<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>;
@@ -6925,12 +7286,15 @@ __global__ static void indexer_topk_8192_cub_kernel(
     }
 }
 
+template <bool STEP>
 __global__ static void indexer_topk_1024_kernel(
         uint32_t *selected,
         const float *scores,
-        uint32_t n_comp,
+        uint32_t n_comp_arg,
+        uint32_t step_il,
         uint32_t n_tokens,
         uint32_t top_k) {
+    const uint32_t n_comp = STEP ? g_step_state_dev.n_index_comp[step_il] : n_comp_arg;
     uint32_t t = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens || tid >= 1024u) return;
@@ -6973,13 +7337,15 @@ __global__ static void indexer_topk_1024_kernel(
     if (tid < top_k) selected[(uint64_t)t * top_k + tid] = idxs[tid];
 }
 
-template <uint32_t SORT_N>
+template <uint32_t SORT_N, bool STEP>
 __global__ static void indexer_topk_pow2_kernel(
         uint32_t *selected,
         const float *scores,
-        uint32_t n_comp,
+        uint32_t n_comp_arg,
+        uint32_t step_il,
         uint32_t n_tokens,
         uint32_t top_k) {
+    const uint32_t n_comp = STEP ? g_step_state_dev.n_index_comp[step_il] : n_comp_arg;
     uint32_t t = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
@@ -7028,13 +7394,15 @@ __global__ static void indexer_topk_pow2_kernel(
     }
 }
 
-template <uint32_t SORT_N>
+template <uint32_t SORT_N, bool STEP>
 __global__ static void indexer_topk_pow2_u16_kernel(
         uint32_t *selected,
         const float *scores,
-        uint32_t n_comp,
+        uint32_t n_comp_arg,
+        uint32_t step_il,
         uint32_t n_tokens,
         uint32_t top_k) {
+    const uint32_t n_comp = STEP ? g_step_state_dev.n_index_comp[step_il] : n_comp_arg;
     uint32_t t = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
@@ -7333,7 +7701,11 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void 
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd");
     if (!wptr) return 0;
     uint32_t n = n_embd * n_hc;
-    embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
+    if (cuda_token_graph_step_capturing()) {
+        embed_token_hc_kernel<true><<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
+    } else {
+        embed_token_hc_kernel<false><<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
+    }
     return cuda_ok(cudaGetLastError(), "embed token launch");
 }
 
@@ -7391,14 +7763,29 @@ static int indexer_scores_launch(
     if (causal && ratio == 0) return 0;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") == NULL) {
-        indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
-                                                         (const float *)q->ptr,
-                                                         (const float *)weights->ptr,
-                                                         (const float *)index_comp->ptr,
-                                                         n_comp, pos0, ratio,
-                                                         scale, causal ? 1 : 0);
+        if (cuda_token_graph_step_capturing()) {
+            /* Pad the grid to the top-k variant bucket: n_index_comp grows on
+             * emit tokens between captures, and grid dims are baked into the
+             * exec.  Blocks past the live count exit on their first read of
+             * the step state; the scores tensor is comp_cap-sized. */
+            const uint32_t grid_pad = cuda_indexer_score_grid_pad(n_comp);
+            indexer_score_one_direct_kernel<true><<<grid_pad, 128>>>((float *)scores->ptr,
+                                                             (const float *)q->ptr,
+                                                             (const float *)weights->ptr,
+                                                             (const float *)index_comp->ptr,
+                                                             n_comp, g_token_graph_layer_hint_v, pos0, ratio,
+                                                             scale, causal ? 1 : 0);
+        } else {
+            indexer_score_one_direct_kernel<false><<<n_comp, 128>>>((float *)scores->ptr,
+                                                             (const float *)q->ptr,
+                                                             (const float *)weights->ptr,
+                                                             (const float *)index_comp->ptr,
+                                                             n_comp, 0u, pos0, ratio,
+                                                             scale, causal ? 1 : 0);
+        }
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
+    cuda_token_graph_mark_step_impure("indexer scores wmma/generic variant");
     if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_WMMA") == NULL) {
         if (getenv("DS4_CUDA_NO_INDEXER_WMMA128") == NULL) {
@@ -7507,16 +7894,20 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     }
     if (top_k == 512u && n_comp <= 1024u &&
         getenv("DS4_CUDA_NO_TOPK1024") == NULL) {
-        indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                     (const float *)scores->ptr,
-                                                     n_comp, n_tokens, top_k);
+        if (cuda_token_graph_step_capturing()) {
+            indexer_topk_1024_kernel<true><<<n_tokens, 1024>>>((uint32_t *)selected->ptr, (const float *)scores->ptr, n_comp, g_token_graph_layer_hint_v, n_tokens, top_k);
+        } else {
+            indexer_topk_1024_kernel<false><<<n_tokens, 1024>>>((uint32_t *)selected->ptr, (const float *)scores->ptr, n_comp, 0u, n_tokens, top_k);
+        }
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
     if (top_k == 512u && n_comp <= 2048u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
-        indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                           (const float *)scores->ptr,
-                                                           n_comp, n_tokens, top_k);
+        if (cuda_token_graph_step_capturing()) {
+            indexer_topk_pow2_kernel<2048, true><<<n_tokens, 1024>>>((uint32_t *)selected->ptr, (const float *)scores->ptr, n_comp, g_token_graph_layer_hint_v, n_tokens, top_k);
+        } else {
+            indexer_topk_pow2_kernel<2048, false><<<n_tokens, 1024>>>((uint32_t *)selected->ptr, (const float *)scores->ptr, n_comp, 0u, n_tokens, top_k);
+        }
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
     if (top_k == 512u && n_comp <= 4096u &&
@@ -7533,20 +7924,27 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                   dev);
             }
             if (attr_err == cudaSuccess && max_optin_smem >= smem) {
-                attr_err = cudaFuncSetAttribute(indexer_topk_8192_cub_kernel,
-                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                smem);
+                attr_err = cudaFuncSetAttribute(
+                        cuda_token_graph_step_capturing()
+                            ? (const void *)indexer_topk_8192_cub_kernel<true>
+                            : (const void *)indexer_topk_8192_cub_kernel<false>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        smem);
                 if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                                 (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k);
+                    if (cuda_token_graph_step_capturing()) {
+                        indexer_topk_8192_cub_kernel<true><<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr, (const float *)scores->ptr, n_comp, g_token_graph_layer_hint_v, n_tokens, top_k);
+                    } else {
+                        indexer_topk_8192_cub_kernel<false><<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr, (const float *)scores->ptr, n_comp, 0u, n_tokens, top_k);
+                    }
                     return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
                 }
             }
         }
-        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                           (const float *)scores->ptr,
-                                                           n_comp, n_tokens, top_k);
+        if (cuda_token_graph_step_capturing()) {
+            indexer_topk_pow2_kernel<4096, true><<<n_tokens, 1024>>>((uint32_t *)selected->ptr, (const float *)scores->ptr, n_comp, g_token_graph_layer_hint_v, n_tokens, top_k);
+        } else {
+            indexer_topk_pow2_kernel<4096, false><<<n_tokens, 1024>>>((uint32_t *)selected->ptr, (const float *)scores->ptr, n_comp, 0u, n_tokens, top_k);
+        }
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
     }
     if (top_k == 512u && n_comp <= 8192u &&
@@ -7564,24 +7962,32 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                   dev);
             }
             if (attr_err == cudaSuccess && max_optin_smem >= smem) {
-                attr_err = cudaFuncSetAttribute(indexer_topk_8192_cub_kernel,
-                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                smem);
+                attr_err = cudaFuncSetAttribute(
+                        cuda_token_graph_step_capturing()
+                            ? (const void *)indexer_topk_8192_cub_kernel<true>
+                            : (const void *)indexer_topk_8192_cub_kernel<false>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        smem);
                 if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                                 (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k);
+                    if (cuda_token_graph_step_capturing()) {
+                        indexer_topk_8192_cub_kernel<true><<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr, (const float *)scores->ptr, n_comp, g_token_graph_layer_hint_v, n_tokens, top_k);
+                    } else {
+                        indexer_topk_8192_cub_kernel<false><<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr, (const float *)scores->ptr, n_comp, 0u, n_tokens, top_k);
+                    }
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
                 }
             }
         }
-        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                               (const float *)scores->ptr,
-                                                               n_comp, n_tokens, top_k);
+        if (cuda_token_graph_step_capturing()) {
+            indexer_topk_pow2_u16_kernel<8192, true><<<n_tokens, 1024>>>((uint32_t *)selected->ptr, (const float *)scores->ptr, n_comp, g_token_graph_layer_hint_v, n_tokens, top_k);
+        } else {
+            indexer_topk_pow2_u16_kernel<8192, false><<<n_tokens, 1024>>>((uint32_t *)selected->ptr, (const float *)scores->ptr, n_comp, 0u, n_tokens, top_k);
+        }
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
     if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
+        cuda_token_graph_mark_step_impure("indexer topk chunked variant");
         const uint32_t chunk_n = 4096u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
         const uint32_t candidate_stride = n_chunks * top_k;
@@ -8199,7 +8605,11 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, u
 extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
     if (!x || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    if (cuda_token_graph_step_capturing()) {
+        head_rms_norm_rope_tail_kernel<true><<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    } else {
+        head_rms_norm_rope_tail_kernel<false><<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    }
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
 
@@ -8251,7 +8661,11 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
 extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
     if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
-    rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    if (cuda_token_graph_step_capturing()) {
+        rope_tail_kernel<true><<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    } else {
+        rope_tail_kernel<false><<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    }
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
@@ -8269,7 +8683,11 @@ extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_
     if (!raw_cache || !kv || raw_cap == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim);
+    if (cuda_token_graph_step_capturing()) {
+        store_raw_kv_batch_kernel<true><<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim);
+    } else {
+        store_raw_kv_batch_kernel<false><<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim);
+    }
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
@@ -8277,7 +8695,7 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, cons
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
     uint64_t n = (uint64_t)n_tokens * head_dim;
-    store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
+    store_raw_kv_batch_kernel<false><<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }
 extern "C" int ds4_gpu_compressor_store_batch_tensor(
@@ -8313,18 +8731,17 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
     const char *ape = cuda_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
     if (!ape) return 0;
     uint64_t n = (uint64_t)n_tokens * width;
-    compressor_store_kernel<<<(n + 255) / 256, 256>>>(
-            (const float *)kv->ptr,
-            (const float *)sc->ptr,
-            (float *)state_kv->ptr,
-            (float *)state_score->ptr,
-            ape,
-            0,
-            ape_type,
-            head_dim,
-            ratio,
-            pos0,
-            n_tokens);
+    if (cuda_token_graph_step_capturing()) {
+        compressor_store_kernel<true><<<(n + 255) / 256, 256>>>(
+                (const float *)kv->ptr, (const float *)sc->ptr,
+                (float *)state_kv->ptr, (float *)state_score->ptr,
+                ape, 0, ape_type, head_dim, ratio, pos0, n_tokens);
+    } else {
+        compressor_store_kernel<false><<<(n + 255) / 256, 256>>>(
+                (const float *)kv->ptr, (const float *)sc->ptr,
+                (float *)state_kv->ptr, (float *)state_score->ptr,
+                ape, 0, ape_type, head_dim, ratio, pos0, n_tokens);
+    }
     return cuda_ok(cudaGetLastError(), "compressor store launch");
 }
 
@@ -8516,7 +8933,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
                                                    head_dim, n_comp, rms_eps)) return 0;
         if (n_rot != 0) {
             const uint32_t pairs = n_comp * (n_rot / 2u);
-            rope_tail_kernel<<<(pairs + 255) / 256, 256>>>(
+            rope_tail_kernel<false><<<(pairs + 255) / 256, 256>>>(
                     (float *)comp_cache->ptr, n_comp, 1, head_dim, n_rot,
                     pos0, ratio, n_ctx_orig, 0, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
@@ -8591,7 +9008,7 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
                                                head_dim, n_comp, rms_eps)) return 0;
     if (n_rot != 0) {
         const uint32_t pairs = n_comp * (n_rot / 2u);
-        rope_tail_kernel<<<(pairs + 255) / 256, 256>>>(
+        rope_tail_kernel<false><<<(pairs + 255) / 256, 256>>>(
                 (float *)comp_cache->ptr, n_comp, 1, head_dim, n_rot,
                 pos0, ratio, n_ctx_orig, 0, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow);
@@ -8691,36 +9108,40 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         if (!use_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(1, (n_head + 7u) / 8u, 1);
-            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
-                                                                              sinks,
-                                                                              (const float *)q->ptr,
-                                                                              (const float *)raw_kv->ptr,
-                                                                              n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                                              1,
-                                                                              0,
-                                                                              n_raw,
-                                                                              raw_cap,
-                                                                              raw_start,
-                                                                              n_comp,
-                                                                              0,
-                                                                              0,
-                                                                              n_head,
-                                                                              head_dim);
+            if (cuda_token_graph_step_capturing()) {
+                attention_decode_mixed_heads8_online_kernel<true><<<online_grid, 256>>>((float *)heads->ptr,
+                        sinks, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                        n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                        1, 0, n_raw, raw_cap, raw_start, n_comp, g_token_graph_layer_hint_v,
+                        0, 0, n_head, head_dim);
+            } else {
+                attention_decode_mixed_heads8_online_kernel<false><<<online_grid, 256>>>((float *)heads->ptr,
+                        sinks, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                        n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                        1, 0, n_raw, raw_cap, raw_start, n_comp, 0u,
+                        0, 0, n_head, head_dim);
+            }
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
     dim3 grid(1, n_head, 1);
-    attention_decode_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                 sinks,
-                                                 (const float *)q->ptr,
-                                                 (const float *)raw_kv->ptr,
-                                                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                 use_mask ? (const float *)comp_mask->ptr : NULL,
-                                                 use_mask,
-                                                 1, 0, n_raw, raw_cap, raw_start, n_comp,
-                                                 0, 0, n_head, head_dim);
+    if (cuda_token_graph_step_capturing()) {
+        attention_decode_mixed_kernel<true><<<grid, 256>>>((float *)heads->ptr,
+                sinks, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                use_mask ? (const float *)comp_mask->ptr : NULL, use_mask,
+                1, 0, n_raw, raw_cap, raw_start, n_comp, g_token_graph_layer_hint_v,
+                0, 0, n_head, head_dim);
+    } else {
+        attention_decode_mixed_kernel<false><<<grid, 256>>>((float *)heads->ptr,
+                sinks, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                use_mask ? (const float *)comp_mask->ptr : NULL, use_mask,
+                1, 0, n_raw, raw_cap, raw_start, n_comp, 0u,
+                0, 0, n_head, head_dim);
+    }
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
@@ -8864,7 +9285,7 @@ static int attention_decode_batch_launch(
         if (!use_comp_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
-            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
+            attention_decode_mixed_heads8_online_kernel<false><<<online_grid, 256>>>((float *)heads->ptr,
                                                                               sinks,
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
@@ -8875,6 +9296,7 @@ static int attention_decode_batch_launch(
                                                                               raw_cap,
                                                                               raw_start,
                                                                               n_comp,
+                                                                              0u,
                                                                               window,
                                                                               ratio,
                                                                               n_head,
@@ -8888,7 +9310,7 @@ static int attention_decode_batch_launch(
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
+        attention_decode_mixed_heads8_online_kernel<false><<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
@@ -8899,6 +9321,7 @@ static int attention_decode_batch_launch(
                                                                    raw_cap,
                                                                    raw_start,
                                                                    n_comp,
+                                                                   0u,
                                                                    window,
                                                                    ratio,
                                                                    n_head,
@@ -8906,14 +9329,14 @@ static int attention_decode_batch_launch(
         return cuda_ok(cudaGetLastError(), "attention decode window launch");
     }
     dim3 grid(n_tokens, n_head, 1);
-    attention_decode_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
+    attention_decode_mixed_kernel<false><<<grid, 256>>>((float *)heads->ptr,
                                                  sinks,
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
-                                                 raw_start, n_comp, window, ratio, n_head, head_dim);
+                                                 raw_start, n_comp, 0u, window, ratio, n_head, head_dim);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
@@ -9058,23 +9481,19 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         return cuda_ok(cudaGetLastError(), "attention indexed heads8 launch");
     }
     dim3 grid(n_tokens, n_head, 1);
-    attention_indexed_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                  sinks,
-                                                  (const float *)q->ptr,
-                                                  (const float *)raw_kv->ptr,
-                                                  (const float *)comp_kv->ptr,
-                                                  topk_ptr,
-                                                  n_tokens,
-                                                  pos0,
-                                                  n_raw,
-                                                  raw_cap,
-                                                  raw_start,
-                                                  n_comp,
-                                                  top_k,
-                                                  window,
-                                                  ratio,
-                                                  n_head,
-                                                  head_dim);
+    if (cuda_token_graph_step_capturing()) {
+        attention_indexed_mixed_kernel<true><<<grid, 256>>>((float *)heads->ptr,
+                sinks, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                (const float *)comp_kv->ptr, topk_ptr,
+                n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+                g_token_graph_layer_hint_v, top_k, window, ratio, n_head, head_dim);
+    } else {
+        attention_indexed_mixed_kernel<false><<<grid, 256>>>((float *)heads->ptr,
+                sinks, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                (const float *)comp_kv->ptr, topk_ptr,
+                n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+                0u, top_k, window, ratio, n_head, head_dim);
+    }
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
 }
 
@@ -9568,20 +9987,39 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
         if (!hash) ok = 0;
     }
     if (ok) {
+        const int step = cuda_token_graph_step_capturing();
         if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
             getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
             dim3 block(32, 4, 1);
-            router_select_warp_topk_kernel<<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
-                                                         bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                                         has_bias && !hash_mode, hash_mode);
+            if (step) {
+                router_select_warp_topk_kernel<true><<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+                                                             bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                                             has_bias && !hash_mode, hash_mode);
+            } else {
+                router_select_warp_topk_kernel<false><<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+                                                             bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                                             has_bias && !hash_mode, hash_mode);
+            }
         } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
-            router_select_parallel_kernel<<<1, 256>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
-                                                      bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                                      has_bias && !hash_mode, hash_mode);
+            if (step) {
+                router_select_parallel_kernel<true><<<1, 256>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+                                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                                          has_bias && !hash_mode, hash_mode);
+            } else {
+                router_select_parallel_kernel<false><<<1, 256>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+                                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                                          has_bias && !hash_mode, hash_mode);
+            }
         } else {
-            router_select_kernel<<<1, 1>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
-                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                          has_bias && !hash_mode, hash_mode);
+            if (step) {
+                router_select_kernel<true><<<1, 1>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+                                              bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                              has_bias && !hash_mode, hash_mode);
+            } else {
+                router_select_kernel<false><<<1, 1>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+                                              bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                              has_bias && !hash_mode, hash_mode);
+            }
         }
         ok = cuda_ok(cudaGetLastError(), "router_select launch");
     }
@@ -9613,7 +10051,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
     if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
         getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
         dim3 block(32, 4, 1);
-        router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
+        router_select_warp_topk_kernel<false><<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
                                                                         (float *)weights->ptr,
                                                                         (float *)probs->ptr,
                                                                         bias,
@@ -9626,7 +10064,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                                         has_bias && !hash_mode,
                                                                         hash_mode);
     } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
-        router_select_parallel_kernel<<<n_tokens, 256>>>((int32_t *)selected->ptr,
+        router_select_parallel_kernel<false><<<n_tokens, 256>>>((int32_t *)selected->ptr,
                                                          (float *)weights->ptr,
                                                          (float *)probs->ptr,
                                                          bias,
@@ -9639,7 +10077,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                          has_bias && !hash_mode,
                                                          hash_mode);
     } else {
-        router_select_kernel<<<n_tokens, 1>>>((int32_t *)selected->ptr,
+        router_select_kernel<false><<<n_tokens, 1>>>((int32_t *)selected->ptr,
                                               (float *)weights->ptr,
                                               (float *)probs->ptr,
                                               bias,
@@ -12440,7 +12878,7 @@ static int routed_moe_launch(
                 tile16_total = use_down_tile16 ? (uint32_t *)(scratch + tile16_total_off) : NULL;
                 tile16_experts = use_down_tile16 ? (uint32_t *)(scratch + tile16_experts_off) : NULL;
                 tile16_starts = use_down_tile16 ? (uint32_t *)(scratch + tile16_starts_off) : NULL;
-                ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "routed_moe sorted counts clear");
+                ok = cuda_ok(cudaMemsetAsync(counts, 0, counts_bytes, cudaStreamPerThread), "routed_moe sorted counts clear");
                 if (ok) {
                     moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
                         counts,

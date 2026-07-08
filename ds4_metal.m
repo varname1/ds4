@@ -6411,6 +6411,15 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
     }
 }
 
+/* Token-graph capture is a CUDA-only fast path; Metal already encodes the
+ * whole token into one command buffer, so the normal path is used. */
+ds4_gpu_step_state *ds4_gpu_token_step_state(void) { return NULL; }
+int ds4_gpu_token_capture_begin(uint64_t sig, int replay_ok) { (void)sig; (void)replay_ok; return 0; }
+int ds4_gpu_token_capture_end(int encode_ok, uint64_t sig) { (void)encode_ok; (void)sig; return 2; }
+void ds4_gpu_token_graph_layer_hint(uint32_t il) { (void)il; }
+int ds4_gpu_attention_decode_variant(uint32_t n_comp) { (void)n_comp; return 0; }
+uint32_t ds4_gpu_indexer_topk_bucket(uint32_t n_comp) { (void)n_comp; return 0; }
+
 int ds4_gpu_begin_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return 0;

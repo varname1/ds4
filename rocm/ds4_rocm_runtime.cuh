@@ -4594,6 +4594,15 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
+/* Token-graph capture is a CUDA-only fast path for now; ROCm/HIP uses the
+ * normal per-launch path (hipGraph port is a follow-up). */
+extern "C" ds4_gpu_step_state *ds4_gpu_token_step_state(void) { return NULL; }
+extern "C" int ds4_gpu_token_capture_begin(uint64_t sig, int replay_ok) { (void)sig; (void)replay_ok; return 0; }
+extern "C" int ds4_gpu_token_capture_end(int encode_ok, uint64_t sig) { (void)encode_ok; (void)sig; return 2; }
+extern "C" void ds4_gpu_token_graph_layer_hint(uint32_t il) { (void)il; }
+extern "C" int ds4_gpu_attention_decode_variant(uint32_t n_comp) { (void)n_comp; return 0; }
+extern "C" uint32_t ds4_gpu_indexer_topk_bucket(uint32_t n_comp) { (void)n_comp; return 0; }
+
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_end_commands(void) {
