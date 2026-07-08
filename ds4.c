@@ -14850,6 +14850,7 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_row,
         uint32_t                n_raw,
         int                     token) {
+    ds4_gpu_token_graph_layer_hint(il);
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -19458,6 +19459,65 @@ static bool metal_graph_eval_token_raw_swa_streaming(
 }
 
 /* Execute one Metal decode token and read back logits. */
+/* Stage-2 replay prep: fill the pinned step-state block and compute the
+ * variant signature for this token.  The signature mixes every predicate that
+ * bakes a per-token counter into a kernel variant or grid shape (via the
+ * ds4_gpu_* helpers, which share the launch wrappers' thresholds and env kill
+ * switches).  Returns 1 when the token is replay-eligible: no compressor emit
+ * in any layer (emit cadence is pure in pos), replayable top-k variants, no
+ * pos-dependent debug/profile hooks. */
+static int metal_graph_token_step_prepare(
+        ds4_gpu_graph *g,
+        int            token,
+        uint32_t       pos,
+        bool           need_logits,
+        uint64_t      *sig_out) {
+    ds4_gpu_step_state *ss = ds4_gpu_token_step_state();
+    if (!ss || g->raw_cap == 0 || DS4_N_LAYER > DS4_GPU_STEP_MAX_LAYER) return 0;
+
+    const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+    ss->token = (uint32_t)token;
+    ss->pos = pos;
+    ss->raw_row = pos % g->raw_cap;
+    ss->n_raw = n_raw;
+    ss->raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
+
+    int replay_ok = 1;
+    /* Pos-dependent debug dumps / stage profiling change what the encode
+     * does per token; a replayed graph cannot reproduce them. */
+    if (getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
+        getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL) {
+        replay_ok = 0;
+    }
+
+    uint64_t sig = 1469598103934665603ull; /* FNV-1a */
+#define DS4_STEP_SIG_MIX(v) do { sig ^= (uint64_t)(v); sig *= 1099511628211ull; } while (0)
+    DS4_STEP_SIG_MIX(need_logits ? 1u : 2u);
+    const uint32_t sparse_threshold = metal_graph_decode_indexer_sparse_threshold(g);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t n_comp = g->layer_n_comp[il];
+        const uint32_t n_index_comp = g->layer_n_index_comp[il];
+        ss->n_comp[il] = n_comp;
+        ss->n_index_comp[il] = n_index_comp;
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        if ((pos + 1u) % ratio == 0u) replay_ok = 0; /* compressor emit */
+        if (ratio == 4u &&
+            n_comp > sparse_threshold &&
+            n_index_comp > DS4_N_INDEXER_TOP_K) {
+            const uint32_t bucket = ds4_gpu_indexer_topk_bucket(n_index_comp);
+            if (bucket == 0u) replay_ok = 0; /* chunked top-k: grids scale with n */
+            DS4_STEP_SIG_MIX(3u);
+            DS4_STEP_SIG_MIX(bucket);
+        } else {
+            DS4_STEP_SIG_MIX(16u + (uint64_t)ds4_gpu_attention_decode_variant(n_comp));
+        }
+    }
+#undef DS4_STEP_SIG_MIX
+    *sig_out = sig;
+    return replay_ok;
+}
+
 static bool metal_graph_eval_token_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -19480,7 +19540,29 @@ static bool metal_graph_eval_token_raw_swa(
      * mid-capture) - the token transparently re-runs on the normal path. */
     bool ok = false;
     bool executed = false;
-    if (ds4_gpu_token_capture_begin() == 1) {
+    bool replayed = false;
+    uint64_t step_sig = 0;
+    const int step_replay_ok =
+        metal_graph_token_step_prepare(g, token, pos, logits != NULL, &step_sig);
+    const int begin_r = ds4_gpu_token_capture_begin(step_sig, step_replay_ok);
+    if (begin_r == 3) {
+        /* Replayed: the cached graph already executed this token on the GPU.
+         * Mirror the encode's only host-side side effect on a non-emit token:
+         * one cur_hc/after_ffn_hc swap per layer (odd layer count = net one
+         * swap); pos advances in the caller. */
+        if (DS4_N_LAYER & 1u) {
+            ds4_gpu_tensor *tmp = g->cur_hc;
+            g->cur_hc = g->after_ffn_hc;
+            g->after_ffn_hc = tmp;
+        }
+        executed = true;
+        replayed = true;
+        ok = true;
+    } else if (begin_r == 4) {
+        /* Replay launched but the device failed hard; nothing to re-run. */
+        executed = true;
+        ok = false;
+    } else if (begin_r == 1) {
         /* Encode mutates the per-layer compressor emit counters; snapshot
          * them so an abandoned capture can re-encode from identical state.
          * allow_split_flush=false: the mid-encode flush is a device sync,
@@ -19493,7 +19575,7 @@ static bool metal_graph_eval_token_raw_swa(
         memcpy(saved_n_comp, g->layer_n_comp, sizeof(saved_n_comp));
         memcpy(saved_n_index_comp, g->layer_n_index_comp, sizeof(saved_n_index_comp));
         ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, false);
-        const int fin = ds4_gpu_token_capture_end(ok ? 1 : 0);
+        const int fin = ds4_gpu_token_capture_end(ok ? 1 : 0, step_sig);
         if (fin != 2) {
             executed = true;
             ok = ok && fin == 1;
@@ -19514,6 +19596,45 @@ static bool metal_graph_eval_token_raw_swa(
 
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (ok && logits && replayed && getenv("DS4_CUDA_GRAPH_VERIFY") != NULL) {
+        /* Exactness harness (STAGE2-DESIGN gate 2): re-run the replayed token
+         * through the normal path and compare full logits.  Non-emit tokens
+         * are idempotent on GPU state (raw KV slot and compressor stage rows
+         * are pure assignments keyed on pos), so the re-encode is safe. */
+        float *ref = (float *)malloc((uint64_t)DS4_N_VOCAB * sizeof(float));
+        if (ref) {
+            if (DS4_N_LAYER & 1u) { /* restore pre-token hc parity */
+                ds4_gpu_tensor *tmp = g->cur_hc;
+                g->cur_hc = g->after_ffn_hc;
+                g->after_ffn_hc = tmp;
+            }
+            bool rok = ds4_gpu_begin_commands() != 0;
+            if (rok) rok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, true, true);
+            if (rok) rok = ds4_gpu_end_commands() != 0;
+            if (rok) rok = ds4_gpu_tensor_read(g->logits, 0, ref, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            if (rok) {
+                float max_diff = 0.0f;
+                uint32_t n_diff = 0;
+                uint32_t argmax_replay = 0, argmax_ref = 0;
+                for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
+                    if (logits[i] > logits[argmax_replay]) argmax_replay = i;
+                    if (ref[i] > ref[argmax_ref]) argmax_ref = i;
+                }
+                for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+                    const float d = fabsf(logits[i] - ref[i]);
+                    if (d > 0.0f) n_diff++;
+                    if (d > max_diff) max_diff = d;
+                }
+                fprintf(stderr,
+                        "ds4: CUDA graph replay verify pos=%u max|dlogit|=%g n_diff=%u argmax %u%s%u\n",
+                        pos, (double)max_diff, n_diff, argmax_replay,
+                        argmax_replay == argmax_ref ? "==" : "!=", argmax_ref);
+            } else {
+                fprintf(stderr, "ds4: CUDA graph replay verify re-encode FAILED at pos=%u\n", pos);
+            }
+            free(ref);
+        }
     }
     const double t_read = (profile || throttle) ? now_sec() : 0.0;
     if (profile) {

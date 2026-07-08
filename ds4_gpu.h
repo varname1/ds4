@@ -54,19 +54,67 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
-/* Single-token decode graph capture (CUDA: opt-in via DS4_CUDA_GRAPH=1;
- * Metal/ROCm: pass-through to begin/end_commands).
- * ds4_gpu_token_capture_begin() returns 1 when the caller's subsequent ops are
- * being captured (the caller must then finish with ds4_gpu_token_capture_end),
- * or 0 for the normal begin_commands path (the backend already ran
- * begin_commands in that case).
- * ds4_gpu_token_capture_end(encode_ok) returns:
+/* Single-token decode graph capture + replay (CUDA: opt-in via
+ * DS4_CUDA_GRAPH=1; Metal/ROCm: pass-through to the normal path).
+ *
+ * Stage 2 replay: per-token scalars live in ds4_gpu_step_state.  The host
+ * fills the pinned instance (ds4_gpu_token_step_state()) before every decode
+ * token; the first node of every captured graph is a memcpy of that struct to
+ * a device symbol, and graph memcpy nodes re-read their host source on every
+ * cudaGraphLaunch, so a cached executable can be relaunched for a new token
+ * without re-capturing.  Kernels that consume per-token scalars read them
+ * from the device symbol while capturing (template<bool STEP>); the normal
+ * path keeps the original baked-argument instantiations bit-for-bit.
+ *
+ * ds4_gpu_token_capture_begin(sig, replay_ok) returns:
+ *   0 - normal path (caller runs begin/encode/end itself)
+ *   1 - capturing; caller must encode the token and finish with
+ *       ds4_gpu_token_capture_end
+ *   3 - token was REPLAYED from the cached executable (synced, results
+ *       ready); the caller skips the encode and applies its host-side side
+ *       effects (hc ping-pong parity swap)
+ *   4 - replay launched but failed hard; the token must be treated as failed
+ * `sig` is the variant signature: a hash over every predicate that selects a
+ * kernel variant or grid shape from per-token counters (computed with the
+ * exported helpers below).  Replay requires it to match the signature stored
+ * at capture.  `replay_ok` must be 0 on tokens whose topology differs from
+ * the plain non-emit decode token (any compressor emit) - those run the
+ * normal path.
+ *
+ * ds4_gpu_token_capture_end(encode_ok, sig) returns:
  *   1 - token executed via the captured graph (synced, results ready)
  *   2 - capture was abandoned; NOTHING ran - the caller must re-run the
  *       token through the normal begin/encode/end path
  *   0 - hard execution error after a successful launch */
-int ds4_gpu_token_capture_begin(void);
-int ds4_gpu_token_capture_end(int encode_ok);
+#define DS4_GPU_STEP_MAX_LAYER 61
+typedef struct ds4_gpu_step_state {
+    uint32_t token;      /* token id being decoded */
+    uint32_t pos;        /* decode position */
+    uint32_t raw_row;    /* pos % raw_cap (raw KV ring slot) */
+    uint32_t n_raw;      /* raw rows visible to attention */
+    uint32_t raw_start;  /* ring slot of the oldest visible raw row */
+    uint32_t reserved[3];
+    uint32_t n_comp[DS4_GPU_STEP_MAX_LAYER];        /* per-layer compressed rows */
+    uint32_t n_index_comp[DS4_GPU_STEP_MAX_LAYER];  /* per-layer indexer rows */
+} ds4_gpu_step_state;
+
+/* Pinned per-token scalar block; NULL when the backend has no replay support
+ * (Metal/ROCm, or pinned allocation failed).  Fill before every decode token
+ * that may capture or replay. */
+ds4_gpu_step_state *ds4_gpu_token_step_state(void);
+int ds4_gpu_token_capture_begin(uint64_t sig, int replay_ok);
+int ds4_gpu_token_capture_end(int encode_ok, uint64_t sig);
+/* Layer index for kernels whose per-token scalars are per-layer counters
+ * (n_comp[il]/n_index_comp[il]).  Cheap no-op outside capture. */
+void ds4_gpu_token_graph_layer_hint(uint32_t il);
+/* Signature helpers - single source of truth for the same predicates the
+ * launch wrappers use (variant thresholds + env kill switches).
+ * ds4_gpu_attention_decode_variant: which decode attention kernel n_comp
+ * selects (0 = none/error, 1 = mixed, 2 = heads8 online).
+ * ds4_gpu_indexer_topk_bucket: which top-k kernel variant n_index_comp
+ * selects (0 = chunked/per-value - not replayable). */
+int ds4_gpu_attention_decode_variant(uint32_t n_comp);
+uint32_t ds4_gpu_indexer_topk_bucket(uint32_t n_comp);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
