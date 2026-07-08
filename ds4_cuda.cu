@@ -4143,6 +4143,107 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     if (lane == 0) out[row] = acc;
 }
 
+/* K-split decode variants: the warp8 kernels above run one warp per output
+ * row, so small-out projections launch too few blocks to occupy an H200
+ * (e.g. the grouped attention low projection: low_dim=512 -> 64 blocks on
+ * 132 SMs).  Split the reduction dimension across blockIdx.y and combine
+ * with a fixed-order reduce (deterministic, but a different summation tree
+ * than the single-warp loop - numerically equivalent, not bit-identical). */
+__global__ static void matmul_q8_0_preq_warp8_ksplit_kernel(
+        float *partials,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        uint32_t chunk_blocks,
+        int use_dp4a) {
+    ds4_pdl_sync();
+    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const uint64_t b0 = (uint64_t)blockIdx.y * chunk_blocks;
+    uint64_t b1 = b0 + chunk_blocks;
+    if (b1 > blocks) b1 = blocks;
+    const unsigned char *wr = w + row * blocks * 34;
+    float acc = 0.0f;
+    for (uint64_t b = b0 + lane; b < b1; b += 32u) {
+        uint64_t i0 = b * 32;
+        uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const int8_t *xqb = xq + b * 32;
+        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) partials[(uint64_t)blockIdx.y * out_dim + row] = acc;
+}
+
+__global__ static void grouped_q8_0_a_preq_warp8_ksplit_kernel(
+        float *partials,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t group_dim,
+        uint64_t rank,
+        uint32_t n_groups,
+        uint64_t blocks,
+        uint32_t chunk_blocks,
+        int use_dp4a) {
+    ds4_pdl_sync();
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (row >= low_dim) return;
+    const uint64_t b0 = (uint64_t)blockIdx.y * chunk_blocks;
+    uint64_t b1 = b0 + chunk_blocks;
+    if (b1 > blocks) b1 = blocks;
+    const uint64_t group = row / rank;
+    const uint64_t row_in_group = row - group * rank;
+    const unsigned char *wr = w + (group * rank + row_in_group) * blocks * 34;
+    const int8_t *xqr = xq + group * blocks * 32;
+    const float *xsr = xscale + group * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = b0 + lane; b < b1; b += 32u) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const int8_t *xqb = xqr + b * 32;
+        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+        acc += __half2float(*scale_h) * xsr[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) partials[(uint64_t)blockIdx.y * low_dim + row] = acc;
+}
+
+__global__ static void ksplit_reduce_rows_kernel(
+        float *out,
+        const float *partials,
+        uint64_t out_dim,
+        uint32_t ksplit) {
+    ds4_pdl_sync();
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= out_dim) return;
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < ksplit; k++) acc += partials[(uint64_t)k * out_dim + row];
+    out[row] = acc;
+}
+
+static int cuda_q8_ksplit_factor(uint64_t out_dim, uint64_t blocks) {
+    static int env = -2;
+    if (env == -2) {
+        const char *e = getenv("DS4_CUDA_NO_Q8_KSPLIT");
+        env = (e && e[0] && strcmp(e, "0") != 0) ? 0 : -1;
+    }
+    if (env == 0) return 1;
+    /* Row-starved regime only: small out (few warps) with enough K to split. */
+    if (out_dim > 4096u || blocks < 64u) return 1;
+    return 4;
+}
+
 __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
         float *out0,
         float *out1,
@@ -8295,7 +8396,11 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     const uint64_t xq_bytes = n_tok * blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + n_tok * blocks * sizeof(float);
+    const int ksplit = n_tok == 1 ? cuda_q8_ksplit_factor(out_dim, blocks) : 1;
+    const uint64_t scales_bytes = n_tok * blocks * sizeof(float);
+    const uint64_t partials_offset = (scale_offset + scales_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes = partials_offset +
+        (ksplit > 1 ? (uint64_t)ksplit * out_dim * sizeof(float) : 0u);
     void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
@@ -8304,6 +8409,17 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
     ds4_launch(quantize_q8_0_f32_kernel, qgrid, 32, 0, xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
+    if (n_tok == 1 && ksplit > 1) {
+        float *partials = (float *)((char *)tmp + partials_offset);
+        const uint32_t chunk_blocks = (uint32_t)((blocks + ksplit - 1) / (uint64_t)ksplit);
+        dim3 kgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)ksplit, 1);
+        ds4_launch(matmul_q8_0_preq_warp8_ksplit_kernel, kgrid, 256, 0, partials,
+            reinterpret_cast<const unsigned char *>(wptr), xq, xscale, in_dim, out_dim, blocks, chunk_blocks, use_dp4a);
+        if (!cuda_ok(cudaGetLastError(), label)) return 0;
+        ds4_launch(ksplit_reduce_rows_kernel, ((unsigned)out_dim + 255u) / 256u, 256, 0, (float *)out->ptr,
+            partials, out_dim, (uint32_t)ksplit);
+        return cuda_ok(cudaGetLastError(), label);
+    }
     if (n_tok == 1) {
         ds4_launch(matmul_q8_0_preq_warp8_kernel, ((unsigned)out_dim + 7u) / 8u, 256, 0, (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
@@ -8385,7 +8501,11 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
 
     const uint64_t xq_bytes = blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+    const uint64_t pair_max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    const int ksplit = cuda_q8_ksplit_factor(pair_max_out, blocks);
+    const uint64_t partials_offset = (scale_offset + blocks * sizeof(float) + 15u) & ~15ull;
+    const uint64_t tmp_bytes = partials_offset +
+        (ksplit > 1 ? (uint64_t)ksplit * (out0_dim + out1_dim) * sizeof(float) : 0u);
     void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 pair prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
@@ -8395,6 +8515,23 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     ds4_launch(quantize_q8_0_f32_kernel, qgrid, 32, 0, xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    if (ksplit > 1) {
+        const uint32_t chunk_blocks = (uint32_t)((blocks + ksplit - 1) / (uint64_t)ksplit);
+        float *p0 = (float *)((char *)tmp + partials_offset);
+        float *p1 = p0 + (uint64_t)ksplit * out0_dim;
+        dim3 kgrid0(((unsigned)out0_dim + 7u) / 8u, (unsigned)ksplit, 1);
+        ds4_launch(matmul_q8_0_preq_warp8_ksplit_kernel, kgrid0, 256, 0, p0,
+            reinterpret_cast<const unsigned char *>(w0), xq, xscale, in_dim, out0_dim, blocks, chunk_blocks, use_dp4a);
+        dim3 kgrid1(((unsigned)out1_dim + 7u) / 8u, (unsigned)ksplit, 1);
+        ds4_launch(matmul_q8_0_preq_warp8_ksplit_kernel, kgrid1, 256, 0, p1,
+            reinterpret_cast<const unsigned char *>(w1), xq, xscale, in_dim, out1_dim, blocks, chunk_blocks, use_dp4a);
+        if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair ksplit launch")) return 0;
+        ds4_launch(ksplit_reduce_rows_kernel, ((unsigned)out0_dim + 255u) / 256u, 256, 0, (float *)out0->ptr,
+            p0, out0_dim, (uint32_t)ksplit);
+        ds4_launch(ksplit_reduce_rows_kernel, ((unsigned)out1_dim + 255u) / 256u, 256, 0, (float *)out1->ptr,
+            p1, out1_dim, (uint32_t)ksplit);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair ksplit reduce launch");
+    }
     ds4_launch(matmul_q8_0_pair_preq_warp8_kernel, ((unsigned)max_out + 7u) / 8u, 256, 0, (float *)out0->ptr,
             (float *)out1->ptr,
             reinterpret_cast<const unsigned char *>(w0),
@@ -9993,7 +10130,11 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     const uint64_t x_rows = (uint64_t)n_groups;
     const uint64_t xq_bytes = x_rows * blocks_a * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + x_rows * blocks_a * sizeof(float);
+    const int ksplit = cuda_q8_ksplit_factor(low_dim, blocks_a);
+    const uint64_t scales_bytes = x_rows * blocks_a * sizeof(float);
+    const uint64_t partials_offset = (scale_offset + scales_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes = partials_offset +
+        (ksplit > 1 ? (uint64_t)ksplit * low_dim * sizeof(float) : 0u);
     void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output low q8 prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
@@ -10006,6 +10147,18 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
                                             group_dim,
                                             blocks_a);
     if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) return 0;
+    if (ksplit > 1) {
+        float *partials = (float *)((char *)tmp + partials_offset);
+        const uint32_t chunk_blocks = (uint32_t)((blocks_a + ksplit - 1) / (uint64_t)ksplit);
+        dim3 kgrid(((unsigned)low_dim + 7u) / 8u, (unsigned)ksplit, 1);
+        ds4_launch(grouped_q8_0_a_preq_warp8_ksplit_kernel, kgrid, 256, 0, partials,
+            out_a, xq, xscale, group_dim, rank, n_groups, blocks_a,
+            chunk_blocks, use_dp4a);
+        if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 ksplit launch")) return 0;
+        ds4_launch(ksplit_reduce_rows_kernel, ((unsigned)low_dim + 255u) / 256u, 256, 0, (float *)low->ptr,
+            partials, low_dim, (uint32_t)ksplit);
+        return cuda_ok(cudaGetLastError(), "attention_output_low_q8 reduce launch");
+    }
     dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
     ds4_launch(grouped_q8_0_a_preq_warp8_kernel, grid_a, 256, 0, (float *)low->ptr,
                                                       out_a,
