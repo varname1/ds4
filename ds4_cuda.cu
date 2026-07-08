@@ -3865,6 +3865,45 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     }
 }
 
+/* Coalesced re-tile of the ordered-chunks pair kernel below: one WARP per
+ * row (4 rows per 128-thread block) with stride-32 lane reads, so loads
+ * coalesce and the grid keeps its width.  The warp-shuffle reduction is a
+ * fixed tree - deterministic run-to-run, but a different summation order
+ * than the chunked loop (numerically equivalent, not bit-identical).
+ * Opt out with DS4_CUDA_NO_F16_RETILE=1. */
+__global__ static void matmul_f16_pair_warp4_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim) {
+    ds4_pdl_sync();
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint64_t row = (uint64_t)blockIdx.x * 4u + warp;
+    if (row >= out0_dim && row >= out1_dim) return;
+    const __half *wr0 = row < out0_dim ? w0 + row * in_dim : NULL;
+    const __half *wr1 = row < out1_dim ? w1 + row * in_dim : NULL;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (uint64_t i = lane; i < in_dim; i += 32u) {
+        const float xv = x[i];
+        if (wr0) sum0 += __half2float(wr0[i]) * xv;
+        if (wr1) sum1 += __half2float(wr1[i]) * xv;
+    }
+    for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, off);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, off);
+    }
+    if (lane == 0) {
+        if (row < out0_dim) out0[row] = sum0;
+        if (row < out1_dim) out1[row] = sum1;
+    }
+}
+
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         float *out0,
         float *out1,
@@ -8730,6 +8769,17 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
     if (!w0 || !w1) return 0;
+    if (getenv("DS4_CUDA_NO_F16_RETILE") == NULL) {
+        ds4_launch(matmul_f16_pair_warp4_kernel, ((unsigned)out_dim + 3u) / 4u, 128, 0, (float *)out0->ptr,
+            (float *)out1->ptr,
+            w0,
+            w1,
+            (const float *)x->ptr,
+            in_dim,
+            out_dim,
+            out_dim);
+        return cuda_ok(cudaGetLastError(), "matmul_f16 pair warp4 launch");
+    }
     ds4_launch(matmul_f16_pair_ordered_chunks_kernel, (unsigned)out_dim, 32, 0, (float *)out0->ptr,
         (float *)out1->ptr,
         w0,
@@ -11310,6 +11360,80 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_row32_kernel(
     }
 }
 
+/* row16x2 variant: 16 rows per block with gate and up computed by SEPARATE
+ * quarter-warps (2x the parallelism of row32), combined through shared
+ * memory.  Each matrix's per-row dot uses the same 8-lane order as before,
+ * so the output is bit-identical.  Grid: (mid/16, n_expert). */
+__global__ static void moe_gate_up_mid_decode_lut_qwarp32_row16x2_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    ds4_pdl_sync();
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t octet = threadIdx.x >> 3u;      /* 0..31 */
+    uint32_t row_slot = octet >> 1u;         /* 0..15 */
+    uint32_t is_up = octet & 1u;
+    uint32_t pair = blockIdx.y;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    __shared__ cuda_block_q8_K sxq[16];
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ float s_gate[16];
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+        __syncthreads();
+        xqb = sxq;
+    }
+    uint32_t row = blockIdx.x * 16u + row_slot;
+    float acc = 0.0f;
+    if (row < expert_mid_dim) {
+        const char *base = is_up ? up_base : gate_base;
+        const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            acc += dev_dot_iq2_xxs_q8_K_block_lut(wr + b, xqb + b, s_iq2_grid, s_iq2_signs);
+        }
+        acc = quarter_warp_sum_f32(acc, lane);
+    }
+    /* gate octets publish; up octets combine */
+    if (row < expert_mid_dim && !is_up && lane == 0) {
+        float gate = acc;
+        if (clamp > 1.0e-6f && gate > clamp) gate = clamp;
+        s_gate[row_slot] = gate;
+        if (write_aux) gate_out[(uint64_t)pair * expert_mid_dim + row] = gate;
+    }
+    __syncthreads();
+    if (row < expert_mid_dim && is_up && lane == 0) {
+        float up = acc;
+        if (clamp > 1.0e-6f) {
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const float gate = s_gate[row_slot];
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        if (write_aux) up_out[off] = up;
+        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+    }
+}
+
 __global__ static void moe_count_sorted_pairs_kernel(
         uint32_t *counts,
         const int32_t *selected,
@@ -13409,7 +13533,24 @@ static int routed_moe_launch(
                 const uint32_t use_decode_row32 =
                     !q4k_path && n_tokens == 1u && use_decode_lut_gate &&
                     getenv("DS4_CUDA_MOE_NO_DECODE_RETILE") == NULL;
-                if (use_decode_row32) {
+                if (use_decode_row32 && getenv("DS4_CUDA_MOE_NO_ROW16X2") == NULL) {
+                    dim3 wgrid((expert_mid_dim + 15u) / 16u, n_tokens * n_expert, 1);
+                    ds4_launch(moe_gate_up_mid_decode_lut_qwarp32_row16x2_kernel, wgrid, 256, 0, (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        gate_w,
+                        up_w,
+                        xq,
+                        selected_ptr,
+                        (const float *)weights->ptr,
+                        gate_expert_bytes,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        write_gate_up,
+                        clamp);
+                } else if (use_decode_row32) {
                     dim3 wgrid((expert_mid_dim + 31u) / 32u, n_tokens * n_expert, 1);
                     ds4_launch(moe_gate_up_mid_decode_lut_qwarp32_row32_kernel, wgrid, 256, 0, (float *)gate->ptr,
                         (float *)up->ptr,
