@@ -4233,10 +4233,13 @@ __global__ static void ksplit_reduce_rows_kernel(
 }
 
 static int cuda_q8_ksplit_factor(uint64_t out_dim, uint64_t blocks) {
+    /* Measured a wash on H200 decode (41.2-41.8 t/s off vs 40.1-41.3 on):
+     * the extra launches offset the occupancy gain for these stage shapes.
+     * Kept opt-in for tuning on other parts/shapes. */
     static int env = -2;
     if (env == -2) {
-        const char *e = getenv("DS4_CUDA_NO_Q8_KSPLIT");
-        env = (e && e[0] && strcmp(e, "0") != 0) ? 0 : -1;
+        const char *e = getenv("DS4_CUDA_Q8_KSPLIT");
+        env = (e && e[0] && strcmp(e, "0") != 0) ? -1 : 0;
     }
     if (env == 0) return 1;
     /* Row-starved regime only: small out (few warps) with enough K to split. */
