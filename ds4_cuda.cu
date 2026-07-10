@@ -5414,9 +5414,18 @@ __global__ static void attention_decode_mixed_kernel(
  * Decode-only (n_tokens==1, no comp mask); indexed attention keeps the
  * existing kernels.  Opt in with DS4_CUDA_TILED_ATTENTION=1. */
 enum {
-    DS4_TILED_ATTN_ROWS = 64u,
+    DS4_TILED_ATTN_ROWS = 64u,   /* max rows per tile == rowbuf capacity plan */
     DS4_TILED_ATTN_HEADS = 8u,
 };
+
+/* Small contexts want many small tiles (parallelism over the sequential
+ * per-block row chain); deep contexts want fat tiles (combine reads one
+ * partial per tile per head). */
+static uint32_t cuda_tiled_attn_tile_rows(uint32_t n_rows) {
+    if (n_rows <= 768u) return 16u;
+    if (n_rows <= 3072u) return 32u;
+    return 64u;
+}
 
 template <bool STEP>
 __global__ static void attention_decode_tiled_kernel(
@@ -5430,6 +5439,7 @@ __global__ static void attention_decode_tiled_kernel(
         uint32_t raw_start_arg,
         uint32_t n_comp_arg,
         uint32_t step_il,
+        uint32_t tile_rows,
         uint32_t n_head,
         uint32_t head_dim) {
     ds4_pdl_sync();
@@ -5440,11 +5450,11 @@ __global__ static void attention_decode_tiled_kernel(
     const uint32_t n_rows = raw_count + n_comp;
     const uint32_t tile = blockIdx.x;
     const uint32_t h0 = blockIdx.y * DS4_TILED_ATTN_HEADS;
-    const uint32_t r0 = tile * DS4_TILED_ATTN_ROWS;
+    const uint32_t r0 = tile * tile_rows;
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;   /* warp w owns head h0 + w */
-    uint32_t r1 = r0 + DS4_TILED_ATTN_ROWS;
+    uint32_t r1 = r0 + tile_rows;
     if (r1 > n_rows) r1 = n_rows;
 
     __shared__ float qs[DS4_TILED_ATTN_HEADS][512];
@@ -5523,6 +5533,7 @@ __global__ static void attention_decode_tiled_combine_kernel(
         uint32_t n_raw_arg,
         uint32_t n_comp_arg,
         uint32_t step_il,
+        uint32_t tile_rows,
         uint32_t n_head,
         uint32_t head_dim) {
     ds4_pdl_sync();
@@ -5530,7 +5541,7 @@ __global__ static void attention_decode_tiled_combine_kernel(
     const uint32_t n_comp = STEP ? g_step_state_dev.n_comp[step_il] : n_comp_arg;
     const uint32_t raw_count = n_raw_in > 256u ? 256u : n_raw_in;
     const uint32_t n_rows = raw_count + n_comp;
-    const uint32_t n_tiles = (n_rows + DS4_TILED_ATTN_ROWS - 1u) / DS4_TILED_ATTN_ROWS;
+    const uint32_t n_tiles = (n_rows + tile_rows - 1u) / tile_rows;
     const uint32_t h = blockIdx.x;
     if (h >= n_head) return;
     const uint32_t tid = threadIdx.x;
@@ -9851,6 +9862,35 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    /* Tiled decode attention (opt-in): streams each KV row once per 8-head
+     * tile instead of once per head, with a per-head combine pass.  Works
+     * for any n_comp (no score smem).  Skipped under token-graph capture:
+     * the grid shape depends on the per-token row count, which would bake a
+     * stale topology into the captured graph. */
+    if (!use_mask && head_dim == 512u && n_head % DS4_TILED_ATTN_HEADS == 0u &&
+        !cuda_token_graph_step_capturing() &&
+        getenv("DS4_CUDA_TILED_ATTENTION") != NULL) {
+        const uint32_t raw_count = n_raw > 256u ? 256u : n_raw;
+        const uint32_t n_rows = raw_count + n_comp;
+        const uint32_t tile_rows = cuda_tiled_attn_tile_rows(n_rows);
+        const uint32_t n_tiles = (n_rows + tile_rows - 1u) / tile_rows;
+        const uint64_t p_bytes = (uint64_t)n_tiles * n_head * head_dim * sizeof(float);
+        const uint64_t ms_bytes = (uint64_t)n_tiles * n_head * 2u * sizeof(float);
+        char *scratch = (char *)cuda_tmp_alloc(p_bytes + ms_bytes, "tiled attention partials");
+        if (scratch) {
+            float *part_p = (float *)scratch;
+            float *part_ms = (float *)(scratch + p_bytes);
+            dim3 tgrid(n_tiles, n_head / DS4_TILED_ATTN_HEADS, 1);
+            ds4_launch(attention_decode_tiled_kernel<false>, tgrid, 256, 0,
+                    part_p, part_ms, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                    n_raw, raw_cap, raw_start, n_comp, 0u, tile_rows, n_head, head_dim);
+            ds4_launch(attention_decode_tiled_combine_kernel<false>, n_head, 256, 0,
+                    (float *)heads->ptr, part_p, part_ms, sinks,
+                    n_raw, n_comp, 0u, tile_rows, n_head, head_dim);
+            return cuda_ok(cudaGetLastError(), "attention decode tiled launch");
+        }
+    }
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
@@ -9913,7 +9953,7 @@ static void cuda_attention_microbench(void) {
     const uint64_t qn = (uint64_t)n_head * head_dim;
     const uint64_t rawn = (uint64_t)raw_cap * head_dim;
     const uint64_t compn = (uint64_t)comp_cap * head_dim;
-    const uint32_t max_tiles = (256u + comp_cap + DS4_TILED_ATTN_ROWS - 1u) / DS4_TILED_ATTN_ROWS;
+    const uint32_t max_tiles = (256u + comp_cap + 15u) / 16u;
     if (cudaMalloc(&q, qn * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&raw, rawn * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&comp, compn * sizeof(float)) != cudaSuccess ||
@@ -9955,7 +9995,8 @@ static void cuda_attention_microbench(void) {
         for (uint32_t ci = 0; ci < sizeof(comps) / sizeof(comps[0]); ci++) {
             const uint32_t n_raw = raws[ri], n_comp = comps[ci];
             const uint32_t n_rows = (n_raw > 256u ? 256u : n_raw) + n_comp;
-            const uint32_t n_tiles = (n_rows + DS4_TILED_ATTN_ROWS - 1u) / DS4_TILED_ATTN_ROWS;
+            const uint32_t tile_rows = cuda_tiled_attn_tile_rows(n_rows);
+            const uint32_t n_tiles = (n_rows + tile_rows - 1u) / tile_rows;
             dim3 tgrid(n_tiles, n_head / DS4_TILED_ATTN_HEADS, 1);
 #define DS4_BENCH_REF() \
             ds4_launch(attention_decode_mixed_kernel<false>, grid, 256, 0, \
@@ -9967,10 +10008,10 @@ static void cuda_attention_microbench(void) {
             do { \
                 ds4_launch(attention_decode_tiled_kernel<false>, tgrid, 256, 0, \
                         part_p, part_ms, q, raw, n_comp ? comp : raw, \
-                        n_raw, raw_cap, 0u, n_comp, 0u, n_head, head_dim); \
+                        n_raw, raw_cap, 0u, n_comp, 0u, tile_rows, n_head, head_dim); \
                 ds4_launch(attention_decode_tiled_combine_kernel<false>, n_head, 256, 0, \
                         heads2, part_p, part_ms, sinks, \
-                        n_raw, n_comp, 0u, n_head, head_dim); \
+                        n_raw, n_comp, 0u, tile_rows, n_head, head_dim); \
             } while (0)
             for (int i = 0; i < 10; i++) { DS4_BENCH_REF(); DS4_BENCH_TILED(); }
             if (cudaDeviceSynchronize() != cudaSuccess) {
