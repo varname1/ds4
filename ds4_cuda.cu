@@ -205,6 +205,19 @@ static uint64_t g_stream_expert_runtime_gate_bytes;
 static uint64_t g_stream_expert_runtime_down_bytes;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
+
+/* q8 SoA repack cache: per weight range, scales and quants rearranged into
+ * separate contiguous arrays (same total bytes as the q8_0 stream).  Built
+ * lazily on first decode use; the SoA GEMV reads quants as aligned int4
+ * vectors and measured 1.9-2.6 TB/s vs 1.15-1.4 TB/s for the interleaved
+ * 34-byte-block layout. */
+typedef struct {
+    __half *scales;
+    int8_t *quants;
+} cuda_q8_soa_entry;
+static std::unordered_map<uint64_t, cuda_q8_soa_entry> g_q8_soa_by_offset;
+static uint64_t g_q8_soa_bytes;
+static int g_q8_soa_disabled;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_budget_notice_printed;
@@ -722,6 +735,7 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
     if (!g_q8_f16_ranges.empty()) {
         (void)cudaDeviceSynchronize();
         cuda_q8_f16_cache_release_all();
+    cuda_q8_soa_cache_release_all();
     }
     (void)cudaGetLastError();
 }
@@ -4279,6 +4293,24 @@ __global__ static void matmul_q8_0_soa_warp8_kernel(
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) out[row] = acc;
+}
+
+/* One-time transform of a q8_0 weight stream into the SoA layout above.
+ * Byte loads throughout: the source stride is 34 so block bases have no
+ * useful alignment. */
+__global__ static void q8_soa_repack_kernel(
+        __half *scales,
+        int8_t *quants,
+        const unsigned char *w,
+        uint64_t total_blocks) {
+    ds4_pdl_sync();
+    const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= total_blocks) return;
+    const unsigned char *src = w + b * 34u;
+    const uint16_t sv = (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+    scales[b] = __ushort_as_half(sv);
+    int8_t *dst = quants + b * 32u;
+    for (uint32_t i = 0; i < 32u; i++) dst[i] = (int8_t)src[2u + i];
 }
 
 /* K-split decode variants: the warp8 kernels above run one warp per output
@@ -8912,6 +8944,74 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
                                       n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "topk mask launch");
 }
+static int cuda_q8_soa_ptrs(const void *model_map, uint64_t weight_offset,
+                            uint64_t weight_bytes, uint64_t out_dim, uint64_t blocks,
+                            const char *label,
+                            const __half **scales_out, const int8_t **quants_out) {
+    if (g_q8_soa_disabled || getenv("DS4_CUDA_NO_Q8_SOA") != NULL) return 0;
+    auto it = g_q8_soa_by_offset.find(weight_offset);
+    if (it != g_q8_soa_by_offset.end()) {
+        *scales_out = it->second.scales;
+        *quants_out = it->second.quants;
+        return 1;
+    }
+    uint64_t limit_mb = 16384u;
+    const char *lim = getenv("DS4_CUDA_Q8_SOA_LIMIT_MB");
+    if (lim && lim[0]) {
+        const long v = atol(lim);
+        if (v >= 0) limit_mb = (uint64_t)v;
+    }
+    if ((g_q8_soa_bytes + weight_bytes) / 1048576u > limit_mb) {
+        if (!g_q8_soa_disabled) {
+            fprintf(stderr, "ds4: CUDA q8 SoA cache limit reached at %.0f MiB\n",
+                    (double)g_q8_soa_bytes / 1048576.0);
+            g_q8_soa_disabled = 1;
+        }
+        return 0;
+    }
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, label);
+    if (!wptr) return 0;
+    const uint64_t total_blocks = out_dim * blocks;
+    __half *scales = NULL;
+    int8_t *quants = NULL;
+    cuda_token_graph_note_device_alloc();
+    if (cudaMalloc(&scales, total_blocks * sizeof(__half)) != cudaSuccess ||
+        cudaMalloc(&quants, total_blocks * 32u) != cudaSuccess) {
+        if (scales) (void)cudaFree(scales);
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: CUDA q8 SoA cache alloc failed at %.0f MiB; disabling\n",
+                (double)g_q8_soa_bytes / 1048576.0);
+        g_q8_soa_disabled = 1;
+        return 0;
+    }
+    ds4_launch(q8_soa_repack_kernel, (uint32_t)((total_blocks + 255u) / 256u), 256, 0,
+            scales, quants, (const unsigned char *)wptr, total_blocks);
+    if (!cuda_ok(cudaGetLastError(), "q8 SoA repack launch")) {
+        (void)cudaFree(scales);
+        (void)cudaFree(quants);
+        g_q8_soa_disabled = 1;
+        return 0;
+    }
+    g_q8_soa_bytes += total_blocks * 34u;
+    cuda_q8_soa_entry e;
+    e.scales = scales;
+    e.quants = quants;
+    g_q8_soa_by_offset[weight_offset] = e;
+    *scales_out = scales;
+    *quants_out = quants;
+    return 1;
+}
+
+static void cuda_q8_soa_cache_release_all(void) {
+    for (auto &kv : g_q8_soa_by_offset) {
+        (void)cudaFree(kv.second.scales);
+        (void)cudaFree(kv.second.quants);
+    }
+    g_q8_soa_by_offset.clear();
+    g_q8_soa_bytes = 0;
+    g_q8_soa_disabled = 0;
+}
+
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
@@ -9005,6 +9105,16 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         ds4_launch(ksplit_reduce_rows_kernel, ((unsigned)out_dim + 255u) / 256u, 256, 0, (float *)out->ptr,
             partials, out_dim, (uint32_t)ksplit);
         return cuda_ok(cudaGetLastError(), label);
+    }
+    if (n_tok == 1 && use_dp4a && (in_dim & 31u) == 0u) {
+        const __half *wsc = NULL;
+        const int8_t *wq = NULL;
+        if (cuda_q8_soa_ptrs(model_map, weight_offset, weight_bytes, out_dim, blocks,
+                             label, &wsc, &wq)) {
+            ds4_launch(matmul_q8_0_soa_warp8_kernel, ((unsigned)out_dim + 7u) / 8u, 256, 0,
+                    (float *)out->ptr, wsc, wq, xq, xscale, in_dim, out_dim, blocks);
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 soa warp launch");
+        }
     }
     if (n_tok == 1) {
         ds4_launch(matmul_q8_0_preq_warp8_kernel, ((unsigned)out_dim + 7u) / 8u, 256, 0, (float *)out->ptr,
