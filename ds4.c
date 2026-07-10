@@ -28057,7 +28057,10 @@ int ds4_session_eval_lookup_argmax(ds4_session *s, int first_token,
     float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
     const int start = s->checkpoint.len;
     const bool spec_log = getenv("DS4_SPEC_LOOKUP_LOG") != NULL;
+    const bool spec_timing = getenv("DS4_SPEC_LOOKUP_TIMING") != NULL;
+    const double spec_t0 = spec_timing ? now_sec() : 0.0;
     bool have_frontier = spec_frontier_snapshot(&frontier, s);
+    const double spec_t_snap = spec_timing ? now_sec() : 0.0;
     bool ok = have_frontier;
     bool verifier_ran = false;
     if (ok) {
@@ -28072,6 +28075,13 @@ int ds4_session_eval_lookup_argmax(ds4_session *s, int first_token,
                                             false,
                                             row_tops,
                                             NULL);
+    }
+    if (spec_timing) {
+        fprintf(stderr,
+                "ds4: spec-lookup timing pos=%d drafted=%d snapshot=%.2f ms verify=%.2f ms\n",
+                start, draft_n,
+                (spec_t_snap - spec_t0) * 1000.0,
+                (now_sec() - spec_t_snap) * 1000.0);
     }
     if (ok) {
         int commit_drafts = 1;
