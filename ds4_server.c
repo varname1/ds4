@@ -9988,6 +9988,129 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
+
+/* ---- Speculative-lookup gate (DS4_SPEC_LOOKUP_GATE=1) -------------------
+ * Log-only accept-rate probe for n-gram prompt-lookup speculative decoding:
+ * measures — on real traffic, before any verify machinery is built — how
+ * many upcoming tokens a zero-cost drafter (longest recent 4/3/2-gram suffix
+ * match over prompt + generated text) would have predicted.  Mirrors the
+ * real spec-decode loop: one pending draft at a time; on the first mismatch
+ * the draft resolves with its accepted-prefix length and a new draft forms
+ * at the corrected position.  E[prefix] is the expected free tokens per
+ * verify pass; a K+1-token batched verify costs ~1.1-1.3x one decode, so
+ * the projected speedup is (1 + E[prefix]) / ~1.2.  Zero GPU work. */
+#define SPEC_GATE_K 8
+#define SPEC_GATE_SCAN_CAP 32768
+
+typedef struct {
+    int *hist;
+    int n, cap;
+    int pred[SPEC_GATE_K];
+    int n_pred;                  /* 0 = no pending draft */
+    int checked;
+    uint64_t tokens;
+    uint64_t drafts;
+    uint64_t no_draft;
+    uint64_t resolved;
+    uint64_t prefix_sum;
+    uint64_t accept_at[SPEC_GATE_K];  /* [i] = drafts whose prefix length > i */
+} spec_gate;
+
+static void spec_gate_report(const spec_gate *g, const char *tag) {
+    if (g->tokens < 16) return;
+    const double res = g->resolved ? (double)g->resolved : 1.0;
+    double k3 = 1.0, k8 = 1.0;
+    for (int i = 0; i < SPEC_GATE_K; i++) {
+        const double p = (double)g->accept_at[i] / res;
+        if (i < 3) k3 += p;
+        k8 += p;
+    }
+    fprintf(stderr,
+            "ds4: spec-lookup gate %s: tokens=%llu drafts=%llu no_draft=%llu "
+            "E[prefix]=%.3f P(len>i)=[%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f] "
+            "tokens/verify K3=%.2f K8=%.2f\n",
+            tag,
+            (unsigned long long)g->tokens,
+            (unsigned long long)g->drafts,
+            (unsigned long long)g->no_draft,
+            (double)g->prefix_sum / res,
+            (double)g->accept_at[0] / res, (double)g->accept_at[1] / res,
+            (double)g->accept_at[2] / res, (double)g->accept_at[3] / res,
+            (double)g->accept_at[4] / res, (double)g->accept_at[5] / res,
+            (double)g->accept_at[6] / res, (double)g->accept_at[7] / res,
+            k3, k8);
+}
+
+static void spec_gate_make_draft(spec_gate *g) {
+    g->n_pred = 0;
+    g->checked = 0;
+    const int lo = g->n > SPEC_GATE_SCAN_CAP ? g->n - SPEC_GATE_SCAN_CAP : 0;
+    for (int ng = 4; ng >= 2; ng--) {
+        if (g->n < ng + 1) break;
+        const int *suf = g->hist + g->n - ng;
+        for (int i = g->n - ng - 1; i >= lo; i--) {
+            if (memcmp(g->hist + i, suf, (size_t)ng * sizeof(int)) != 0) continue;
+            const int src = i + ng;
+            int k = 0;
+            for (; k < SPEC_GATE_K && src + k < g->n; k++) g->pred[k] = g->hist[src + k];
+            if (k > 0) {
+                g->n_pred = k;
+                g->drafts++;
+                return;
+            }
+        }
+    }
+    g->no_draft++;
+}
+
+static void spec_gate_init(spec_gate *g, const ds4_tokens *prompt, int ctx) {
+    memset(g, 0, sizeof(*g));
+    if (getenv("DS4_SPEC_LOOKUP_GATE") == NULL) return;
+    g->cap = ctx + 64;
+    if (prompt && prompt->len + 64 > g->cap) g->cap = prompt->len + 64;
+    g->hist = (int *)malloc((size_t)g->cap * sizeof(int));
+    if (!g->hist) return;
+    if (prompt && prompt->len > 0) {
+        memcpy(g->hist, prompt->v, (size_t)prompt->len * sizeof(int));
+        g->n = prompt->len;
+    }
+    spec_gate_make_draft(g);
+}
+
+static void spec_gate_feed(spec_gate *g, int token) {
+    if (!g->hist) return;
+    g->tokens++;
+    if (g->n_pred) {
+        if (token == g->pred[g->checked]) {
+            g->accept_at[g->checked]++;
+            g->checked++;
+        } else {
+            g->prefix_sum += (uint64_t)g->checked;
+            g->resolved++;
+            g->n_pred = 0;
+        }
+        if (g->n_pred && g->checked >= g->n_pred) {
+            g->prefix_sum += (uint64_t)g->checked;
+            g->resolved++;
+            g->n_pred = 0;
+        }
+    }
+    if (g->n >= g->cap) {   /* out of room: stop measuring, keep stats */
+        free(g->hist);
+        g->hist = NULL;
+        return;
+    }
+    g->hist[g->n++] = token;
+    if (!g->n_pred) spec_gate_make_draft(g);
+    if (g->tokens % 1024u == 0u) spec_gate_report(g, "progress");
+}
+
+static void spec_gate_finish(spec_gate *g) {
+    spec_gate_report(g, "final");
+    free(g->hist);
+    g->hist = NULL;
+}
+
 static void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
@@ -10385,6 +10508,8 @@ decode_again:
         getenv("DS4_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
+    spec_gate lookup_gate;
+    spec_gate_init(&lookup_gate, &effective_prompt, ds4_session_ctx(s->session));
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
@@ -10448,6 +10573,7 @@ decode_again:
                 stop_decode = true;
                 break;
             }
+            spec_gate_feed(&lookup_gate, token);
 
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
@@ -10629,6 +10755,7 @@ decode_again:
         }
         if (stop_decode) break;
     }
+    spec_gate_finish(&lookup_gate);
 
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
