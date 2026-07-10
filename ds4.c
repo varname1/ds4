@@ -14887,6 +14887,15 @@ static bool metal_graph_encode_decode_layer(
         !metal_graph_use_reference_hc_decode() &&
         !metal_graph_use_reference_hc_norm_decode();
     bool hc_pre_chain_fused = false;
+    {
+        static bool hc_gate_logged = false;
+        if (!hc_gate_logged) {
+            fprintf(stderr,
+                    "ds4: hc pre fusion gate: ok=%d fuse_hc_norm=%d fn_type=%s\n",
+                    (int)ok, (int)fuse_hc_norm, tensor_type_name(layer->hc_attn_fn->type));
+            hc_gate_logged = true;
+        }
+    }
     if (ok && fuse_hc_norm && (layer->hc_attn_fn->type == DS4_TENSOR_F16 ||
                                layer->hc_attn_fn->type == DS4_TENSOR_F32)) {
         hc_pre_chain_fused = ds4_gpu_hc_pre_norm_fused_tensor(g->attn_cur,

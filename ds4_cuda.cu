@@ -14285,6 +14285,18 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
                                             norm_weight_offset, n_embd, norm_eps);
 }
 
+/* One-shot reject diagnostic: the fusion falling back must be visible in the
+ * server log, not silent (a silent fallback is indistinguishable from an
+ * active fusion — both produce identical output). */
+static int hc_fuse_reject(const char *why) {
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr, "ds4: CUDA hc pre-chain fusion unavailable: %s\n", why);
+        warned = 1;
+    }
+    return 0;
+}
+
 extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,
@@ -14303,14 +14315,14 @@ extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps,
         float                   norm_eps) {
-    if (getenv("DS4_CUDA_NO_HC_FUSION") != NULL) return 0;
+    if (getenv("DS4_CUDA_NO_HC_FUSION") != NULL) return hc_fuse_reject("disabled by env");
     if (!out || !norm_out || !split || !mix || !hc || !model_map ||
         n_embd == 0 || n_hc != 4) {
-        return 0;
+        return hc_fuse_reject("null tensor or unsupported n_hc");
     }
     const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
-    if (hc_dim > 8192u || mix_hc > 24u) return 0;
+    if (hc_dim > 8192u || mix_hc > 24u) return hc_fuse_reject("shape exceeds smem plan");
     const uint64_t mix_bytes = mix_hc * sizeof(float);
     const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
     if (out->bytes < out_row_bytes || out->bytes % out_row_bytes != 0 ||
@@ -14319,7 +14331,7 @@ extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
         mix->bytes < mix_bytes ||
         split->bytes < mix_bytes ||
         hc->bytes < hc_dim * sizeof(float)) {
-        return 0;
+        return hc_fuse_reject("tensor sizes not the single-token decode shape");
     }
     const uint64_t fn_bytes = mix_hc * hc_dim *
         (fn_is_f16 ? sizeof(uint16_t) : sizeof(float));
@@ -14328,7 +14340,7 @@ extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
         base_offset > model_size || mix_bytes > model_size - base_offset ||
         norm_weight_offset > model_size ||
         (uint64_t)n_embd * sizeof(float) > model_size - norm_weight_offset) {
-        return 0;
+        return hc_fuse_reject("weight offsets out of model range");
     }
     const void *fn_w = (const void *)cuda_model_range_ptr(model_map, fn_weight_offset,
             fn_bytes, "hc_fn");
@@ -14338,7 +14350,7 @@ extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
             mix_bytes, "hc_base");
     const float *norm_w = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
             (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
-    if (!fn_w || !scale || !base || !norm_w) return 0;
+    if (!fn_w || !scale || !base || !norm_w) return hc_fuse_reject("model range ptr unavailable");
     const int wide = getenv("DS4_CUDA_HC_FUSION_WIDE") != NULL;
     static int announced = 0;
     if (!announced) {
