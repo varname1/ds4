@@ -4187,6 +4187,57 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     if (lane == 0) out[row] = acc;
 }
 
+/* Coalesced-staging variant of the preq warp8 GEMV.  The direct kernel has
+ * each lane read its own 34-byte q8_0 block (2 B f16 scale + 32 quants) at
+ * a 34-byte stride — unaligned accesses that split transactions and cap the
+ * measured weight bandwidth at ~1.3-1.4 TB/s on an H200.  Here the warp
+ * first stages a 32-block span of the row into shared memory with dense
+ * 16-bit coalesced loads, then runs the SAME per-lane dp4a block dot from
+ * smem.  Values and reduction order are identical to the direct kernel, so
+ * the output is bit-identical; only the load path changes. */
+__global__ static void matmul_q8_0_preq_warp8_coal_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        int use_dp4a) {
+    ds4_pdl_sync();
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + warp;
+    __shared__ unsigned char stage[8][32 * 34];
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 34;
+    float acc = 0.0f;
+    for (uint64_t c0 = 0; c0 < blocks; c0 += 32u) {
+        const uint64_t cn = blocks - c0 < 32u ? blocks - c0 : 32u;
+        const uint64_t span_bytes = cn * 34u;
+        const uint16_t *src16 = (const uint16_t *)(wr + c0 * 34u);
+        uint16_t *dst16 = (uint16_t *)stage[warp];
+        for (uint64_t i = lane; i < span_bytes / 2u; i += 32u) {
+            dst16[i] = src16[i];
+        }
+        __syncwarp();
+        const uint64_t b = c0 + lane;
+        if (lane < cn) {
+            const uint64_t i0 = b * 32u;
+            const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+            const unsigned char *blk = stage[warp] + lane * 34u;
+            const __half *scale_h = (const __half *)blk;
+            const int8_t *qs = (const int8_t *)(blk + 2);
+            const int8_t *xqb = xq + i0;
+            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+        }
+        __syncwarp();
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
+
 /* K-split decode variants: the warp8 kernels above run one warp per output
  * row, so small-out projections launch too few blocks to occupy an H200
  * (e.g. the grouped attention low projection: low_dim=512 -> 64 blocks on
@@ -10107,18 +10158,25 @@ static void cuda_q8_microbench(void) {
         for (int i = 0; i < n; i++) DS4_Q8B_GEMV();
         (void)cudaDeviceSynchronize();
         const double gemv_us = (bench_now_sec() - t0) * 1e6 / n;
-        const int nlat = 50;
+#define DS4_Q8B_GEMV_COAL() \
+        ds4_launch(matmul_q8_0_preq_warp8_coal_kernel, rows_grid, 256, 0, \
+                out, w, xq, xscale, in_dim, out_dim, blocks, use_dp4a)
+        for (int i = 0; i < 10; i++) DS4_Q8B_GEMV_COAL();
+        (void)cudaDeviceSynchronize();
         t0 = bench_now_sec();
-        for (int i = 0; i < nlat; i++) { DS4_Q8B_GEMV(); (void)cudaDeviceSynchronize(); }
-        const double gemv_lat_us = (bench_now_sec() - t0) * 1e6 / nlat;
+        for (int i = 0; i < n; i++) DS4_Q8B_GEMV_COAL();
+        (void)cudaDeviceSynchronize();
+        const double coal_us = (bench_now_sec() - t0) * 1e6 / n;
         fprintf(stderr,
-                "ds4: q8 bench %s %lux%lu quant=%.1f us gemv=%.1f us (lat %.1f us) eff=%.0f GB/s\n",
+                "ds4: q8 bench %s %lux%lu quant=%.1f us gemv=%.1f us (%.0f GB/s) coal=%.1f us (%.0f GB/s)\n",
                 shapes[si].name,
                 (unsigned long)in_dim, (unsigned long)out_dim,
-                quant_us, gemv_us, gemv_lat_us,
-                (double)wbytes / gemv_us / 1000.0);
+                quant_us,
+                gemv_us, (double)wbytes / gemv_us / 1000.0,
+                coal_us, (double)wbytes / coal_us / 1000.0);
 #undef DS4_Q8B_QUANT
 #undef DS4_Q8B_GEMV
+#undef DS4_Q8B_GEMV_COAL
         (void)cudaFree(w); (void)cudaFree(x); (void)cudaFree(out);
         (void)cudaFree(xq); (void)cudaFree(xscale);
     }
