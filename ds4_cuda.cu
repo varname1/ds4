@@ -2348,6 +2348,7 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 }
 
 static void cuda_attention_microbench(void);
+static void cuda_q8_microbench(void);
 
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
@@ -2371,6 +2372,7 @@ extern "C" int ds4_gpu_init(void) {
         g_cublas_ready = 1;
     }
     if (getenv("DS4_CUDA_ATTN_MICROBENCH") != NULL) cuda_attention_microbench();
+    if (getenv("DS4_CUDA_Q8_MICROBENCH") != NULL) cuda_q8_microbench();
     return 1;
 }
 
@@ -10048,6 +10050,78 @@ static void cuda_attention_microbench(void) {
     (void)cudaFree(heads); (void)cudaFree(heads2);
     (void)cudaFree(part_p); (void)cudaFree(part_ms);
     (void)cudaFree(sinks);
+}
+
+/* Startup microbenchmark for the q8_0 GEMV family, DS4_CUDA_Q8_MICROBENCH=1.
+ * Times the activation quantize and the preq_warp8 kernel at the real decode
+ * shapes on synthetic weights, reporting effective weight bandwidth — the
+ * q8 stages (attn_output, q_path, shared) are the largest remaining decode
+ * pool and the question is kernel vs. surrounding-machinery cost. */
+static void cuda_q8_microbench(void) {
+    struct q8_shape { uint64_t in, out; const char *name; };
+    const q8_shape shapes[] = {
+        {4096u, 1024u, "attn_q_a"},
+        {1024u, 32768u, "attn_q_b"},
+        {8192u, 4096u, "attn_output_b"},
+        {4096u, 2048u, "shared_gate"},
+    };
+    for (uint32_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
+        const uint64_t in_dim = shapes[si].in, out_dim = shapes[si].out;
+        const uint64_t blocks = in_dim / 32u;
+        const uint64_t wbytes = out_dim * blocks * 34u;
+        unsigned char *w = NULL;
+        float *x = NULL, *out = NULL, *xscale = NULL;
+        int8_t *xq = NULL;
+        if (cudaMalloc(&w, wbytes) != cudaSuccess ||
+            cudaMalloc(&x, in_dim * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&out, out_dim * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&xq, blocks * 32u) != cudaSuccess ||
+            cudaMalloc(&xscale, blocks * sizeof(float)) != cudaSuccess) {
+            fprintf(stderr, "ds4: q8 microbench alloc failed\n");
+            return;
+        }
+        ds4_launch(fill_f32_kernel, (uint32_t)((wbytes / 4u + 255u) / 256u), 256, 0,
+                (float *)w, wbytes / 4u, 0.001f);
+        ds4_launch(fill_f32_kernel, (uint32_t)((in_dim + 255u) / 256u), 256, 0,
+                x, in_dim, 0.01f);
+        if (cudaDeviceSynchronize() != cudaSuccess) return;
+        const int use_dp4a = cuda_q8_use_dp4a();
+        dim3 qgrid((unsigned)blocks, 1, 1);
+        const uint32_t rows_grid = (uint32_t)((out_dim + 7u) / 8u);
+#define DS4_Q8B_QUANT() \
+        ds4_launch(quantize_q8_0_f32_kernel, qgrid, 32, 0, xq, xscale, x, in_dim, blocks)
+#define DS4_Q8B_GEMV() \
+        ds4_launch(matmul_q8_0_preq_warp8_kernel, rows_grid, 256, 0, \
+                out, w, xq, xscale, in_dim, out_dim, blocks, use_dp4a)
+        for (int i = 0; i < 10; i++) { DS4_Q8B_QUANT(); DS4_Q8B_GEMV(); }
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            fprintf(stderr, "ds4: q8 microbench kernel failed\n");
+            return;
+        }
+        const int n = 200;
+        double t0 = bench_now_sec();
+        for (int i = 0; i < n; i++) DS4_Q8B_QUANT();
+        (void)cudaDeviceSynchronize();
+        const double quant_us = (bench_now_sec() - t0) * 1e6 / n;
+        t0 = bench_now_sec();
+        for (int i = 0; i < n; i++) DS4_Q8B_GEMV();
+        (void)cudaDeviceSynchronize();
+        const double gemv_us = (bench_now_sec() - t0) * 1e6 / n;
+        const int nlat = 50;
+        t0 = bench_now_sec();
+        for (int i = 0; i < nlat; i++) { DS4_Q8B_GEMV(); (void)cudaDeviceSynchronize(); }
+        const double gemv_lat_us = (bench_now_sec() - t0) * 1e6 / nlat;
+        fprintf(stderr,
+                "ds4: q8 bench %s %lux%lu quant=%.1f us gemv=%.1f us (lat %.1f us) eff=%.0f GB/s\n",
+                shapes[si].name,
+                (unsigned long)in_dim, (unsigned long)out_dim,
+                quant_us, gemv_us, gemv_lat_us,
+                (double)wbytes / gemv_us / 1000.0);
+#undef DS4_Q8B_QUANT
+#undef DS4_Q8B_GEMV
+        (void)cudaFree(w); (void)cudaFree(x); (void)cudaFree(out);
+        (void)cudaFree(xq); (void)cudaFree(xscale);
+    }
 }
 
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
