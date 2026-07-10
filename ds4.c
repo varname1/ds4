@@ -10964,6 +10964,10 @@ static bool metal_graph_alloc_raw_cap(
         bool                    enable_mtp) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
+    /* Lookup speculative decoding (DS4_SPEC_LOOKUP=K) reuses the MTP verify
+     * machinery — frontier snapshot scratch + batched spec logits — without
+     * the MTP draft model, so that scratch is allocated for either. */
+    const bool enable_spec = enable_mtp || getenv("DS4_SPEC_LOOKUP") != NULL;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -11069,7 +11073,7 @@ static bool metal_graph_alloc_raw_cap(
                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-            if (enable_mtp) {
+            if (enable_spec) {
                 g->spec_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_prefix1_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
@@ -11092,7 +11096,7 @@ static bool metal_graph_alloc_raw_cap(
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                if (enable_mtp) {
+                if (enable_spec) {
                     g->spec_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_prefix1_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
@@ -11166,8 +11170,10 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
-        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
+    }
+    if (enable_spec) {
+        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
     }
 
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
@@ -11223,7 +11229,7 @@ static bool metal_graph_alloc_raw_cap(
             layer_cache_ok = g->layer_attn_comp_cache[il] != NULL &&
                              g->layer_attn_state_kv[il] != NULL &&
                              g->layer_attn_state_score[il] != NULL &&
-                             (!enable_mtp ||
+                             (!enable_spec ||
                               (g->spec_attn_state_kv[il] != NULL &&
                                g->spec_attn_state_score[il] != NULL &&
                                g->spec_prefix1_attn_state_kv[il] != NULL &&
@@ -11233,7 +11239,7 @@ static bool metal_graph_alloc_raw_cap(
             layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
                              g->layer_index_state_kv[il] != NULL &&
                              g->layer_index_state_score[il] != NULL &&
-                             (!enable_mtp ||
+                             (!enable_spec ||
                               (g->spec_index_state_kv[il] != NULL &&
                                g->spec_index_state_score[il] != NULL &&
                                g->spec_prefix1_index_state_kv[il] != NULL &&
@@ -11264,7 +11270,8 @@ static bool metal_graph_alloc_raw_cap(
                      (g->mtp_embed && g->mtp_enorm && g->mtp_eproj &&
                       g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
                       g->mtp_input_hc && g->mtp_state_hc && g->mtp_next_hc &&
-                      g->mtp_raw_cache && g->spec_logits)) &&
+                      g->mtp_raw_cache)) &&
+                    (!enable_spec || g->spec_logits) &&
                     g->prefill_tokens &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
                     g->batch_hc_mix && g->batch_hc_split &&
@@ -27983,6 +27990,172 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     n_accept);
         }
     }
+    return n_accept;
+#endif
+}
+
+/* Speculative decode with CALLER-SUPPLIED draft tokens (lookup drafting):
+ * same contract as ds4_session_eval_speculative_argmax, but the draft comes
+ * from the caller (e.g. an n-gram prompt-lookup match) instead of the MTP
+ * head, so no draft model runs.  first_token is evaluated and committed
+ * normally; draft[0] is verified for free against the fresh logits; the
+ * rest go through the batched suffix verifier with a compressor-frontier
+ * snapshot for rollback.  Greedy (argmax) only.  Requires the spec verify
+ * scratch, allocated when DS4_SPEC_LOOKUP is set at session creation (or
+ * when MTP is loaded).  Returns the number of committed tokens (>= 1), or
+ * -1 on hard error. */
+int ds4_session_eval_lookup_argmax(ds4_session *s, int first_token,
+                                   const int *draft, int n_draft,
+                                   int max_tokens, int eos_token,
+                                   int *accepted, int accepted_cap,
+                                   char *err, size_t errlen) {
+    if (!s || max_tokens <= 0 || accepted_cap <= 0 || !accepted) return 0;
+    if (s->distributed || ds4_session_is_cpu(s)) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    (void)draft; (void)n_draft; (void)eos_token;
+    snprintf(err, errlen, "GPU support is not compiled in");
+    return -1;
+#else
+    ds4_engine *e = s->engine;
+    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    int n_accept = 0;
+    accepted[n_accept++] = first_token;
+    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
+    if (!draft || n_draft <= 0) return n_accept;
+
+    int draft_cap = n_draft;
+    if (draft_cap > 15) draft_cap = 15;
+    if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
+    if (draft_cap > accepted_cap - n_accept) draft_cap = accepted_cap - n_accept;
+    int room = s->ctx_size - s->checkpoint.len;
+    if (draft_cap > room - 1) draft_cap = room - 1;
+    if (draft_cap <= 0) return n_accept;
+
+    /* draft[0] is verified for free: eval just produced the base logits. */
+    if (sample_argmax(s->logits, DS4_N_VOCAB) != draft[0]) return n_accept;
+
+    int drafts[16];
+    int draft_n = 0;
+    for (; draft_n < draft_cap; draft_n++) {
+        drafts[draft_n] = draft[draft_n];
+        if (draft[draft_n] == eos_token) {
+            draft_n++;
+            break;
+        }
+    }
+    /* A one-token draft buys nothing: the free-verified token would cost one
+     * decode either way (the plain loop resamples it next iteration). */
+    if (draft_n < 2) return n_accept;
+
+    ds4_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    int *row_tops = xmalloc((size_t)draft_n * sizeof(row_tops[0]));
+    float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+    const int start = s->checkpoint.len;
+    const bool spec_log = getenv("DS4_SPEC_LOOKUP_LOG") != NULL;
+    bool have_frontier = spec_frontier_snapshot(&frontier, s);
+    bool ok = have_frontier;
+    bool verifier_ran = false;
+    if (ok) {
+        for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
+        verifier_ran = true;
+        ok = metal_graph_verify_suffix_tops(&s->graph,
+                                            &e->model,
+                                            &e->weights,
+                                            &s->checkpoint,
+                                            (uint32_t)start,
+                                            (uint32_t)draft_n,
+                                            false,
+                                            row_tops,
+                                            NULL);
+    }
+    if (ok) {
+        int commit_drafts = 1;
+        for (int i = 1; i < draft_n; i++) {
+            if (row_tops[i - 1] != drafts[i]) break;
+            commit_drafts++;
+        }
+        if (commit_drafts == draft_n) {
+            ok = metal_graph_read_spec_logits_row(&s->graph,
+                                                  (uint32_t)(draft_n - 1),
+                                                  row_logits);
+            if (ok) {
+                memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+                    accepted[n_accept++] = drafts[i];
+                    if (drafts[i] == eos_token) break;
+                }
+                s->checkpoint_valid = true;
+                if (spec_log) {
+                    fprintf(stderr, "ds4: spec-lookup drafted=%d committed=%d (full)\n",
+                            draft_n, draft_n);
+                }
+                spec_frontier_free(&frontier);
+                free(row_logits);
+                free(row_tops);
+                return n_accept;
+            }
+        } else {
+            /* Partial accept: rewind, then rebuild state for the accepted
+             * prefix with one more batched pass and read its last logits. */
+            s->checkpoint.len = start;
+            ok = spec_frontier_restore(&frontier, s);
+            if (ok) {
+                for (int i = 0; i < commit_drafts; i++) token_vec_push(&s->checkpoint, drafts[i]);
+                ok = metal_graph_verify_suffix_tops(&s->graph,
+                                                    &e->model,
+                                                    &e->weights,
+                                                    &s->checkpoint,
+                                                    (uint32_t)start,
+                                                    (uint32_t)commit_drafts,
+                                                    false,
+                                                    row_tops,
+                                                    NULL);
+                if (ok) ok = metal_graph_read_spec_logits_row(&s->graph,
+                                                              (uint32_t)(commit_drafts - 1),
+                                                              row_logits);
+                if (ok) {
+                    memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+                    for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
+                        accepted[n_accept++] = drafts[i];
+                        if (drafts[i] == eos_token) break;
+                    }
+                    s->checkpoint_valid = true;
+                    if (spec_log) {
+                        fprintf(stderr, "ds4: spec-lookup drafted=%d committed=%d (partial)\n",
+                                draft_n, commit_drafts);
+                    }
+                    spec_frontier_free(&frontier);
+                    free(row_logits);
+                    free(row_tops);
+                    return n_accept;
+                }
+            }
+        }
+    }
+    /* Failure paths: undo the speculation entirely; first_token stays
+     * committed and the caller continues on the normal path. */
+    s->checkpoint.len = start;
+    if (verifier_ran) {
+        if (!have_frontier || !spec_frontier_restore(&frontier, s)) {
+            snprintf(err, errlen, "lookup spec verifier failed");
+            s->checkpoint_valid = false;
+            spec_frontier_free(&frontier);
+            free(row_logits);
+            free(row_tops);
+            return -1;
+        }
+    }
+    if (spec_log) {
+        fprintf(stderr, "ds4: spec-lookup drafted=%d aborted (verifier unavailable)\n", draft_n);
+    }
+    spec_frontier_free(&frontier);
+    free(row_logits);
+    free(row_tops);
     return n_accept;
 #endif
 }

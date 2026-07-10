@@ -10013,6 +10013,7 @@ typedef struct {
     uint64_t no_draft;
     uint64_t resolved;
     uint64_t prefix_sum;
+    uint64_t next_report;
     uint64_t accept_at[SPEC_GATE_K];  /* [i] = drafts whose prefix length > i */
 } spec_gate;
 
@@ -10063,9 +10064,9 @@ static void spec_gate_make_draft(spec_gate *g) {
     g->no_draft++;
 }
 
-static void spec_gate_init(spec_gate *g, const ds4_tokens *prompt, int ctx) {
+static void spec_gate_init_enabled(spec_gate *g, const ds4_tokens *prompt, int ctx, int enabled) {
     memset(g, 0, sizeof(*g));
-    if (getenv("DS4_SPEC_LOOKUP_GATE") == NULL) return;
+    if (!enabled) return;
     g->cap = ctx + 64;
     if (prompt && prompt->len + 64 > g->cap) g->cap = prompt->len + 64;
     g->hist = (int *)malloc((size_t)g->cap * sizeof(int));
@@ -10075,6 +10076,72 @@ static void spec_gate_init(spec_gate *g, const ds4_tokens *prompt, int ctx) {
         g->n = prompt->len;
     }
     spec_gate_make_draft(g);
+}
+
+static void spec_gate_init(spec_gate *g, const ds4_tokens *prompt, int ctx) {
+    spec_gate_init_enabled(g, prompt, ctx, getenv("DS4_SPEC_LOOKUP_GATE") != NULL);
+}
+
+/* ---- Active lookup speculative decoding (DS4_SPEC_LOOKUP=K) ------------
+ * The same n-gram drafter, but drafts feed the batched suffix verifier
+ * (ds4_session_eval_lookup_argmax) instead of being scored.  Greedy
+ * requests only.  DS4_SPEC_LOOKUP=1 means "on" at the default depth;
+ * 2..12 pick the draft length. */
+static int spec_lookup_k_env(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    const char *v = getenv("DS4_SPEC_LOOKUP");
+    int k = 0;
+    if (v && v[0]) {
+        k = atoi(v);
+        if (k == 1) k = 4;
+        if (k < 0) k = 0;
+        if (k > 12) k = 12;
+    }
+    cached = k;
+    return cached;
+}
+
+/* Append the freshly sampled token, then propose up to k following tokens.
+ * Returns the draft length (0 = no n-gram match / history disabled). */
+static int spec_gate_active_draft(spec_gate *g, int token, int *out, int k) {
+    if (!g->hist) return 0;
+    if (g->n >= g->cap) {
+        free(g->hist);
+        g->hist = NULL;
+        return 0;
+    }
+    g->hist[g->n++] = token;
+    spec_gate_make_draft(g);
+    int nd = g->n_pred < k ? g->n_pred : k;
+    for (int i = 0; i < nd; i++) out[i] = g->pred[i];
+    g->n_pred = 0;
+    g->checked = 0;
+    return nd;
+}
+
+/* Record a verify round: toks[0] was decoded normally (already appended by
+ * spec_gate_active_draft); toks[1..n) were committed by the verifier. */
+static void spec_gate_active_commit(spec_gate *g, const int *toks, int n, int drafted) {
+    if (!g->hist) return;
+    g->tokens += (uint64_t)n;
+    if (drafted) {
+        g->resolved++;
+        g->prefix_sum += (uint64_t)(n - 1);
+        for (int i = 1; i < n && i - 1 < SPEC_GATE_K; i++) g->accept_at[i - 1]++;
+    }
+    for (int i = 1; i < n; i++) {
+        if (g->n >= g->cap) {
+            free(g->hist);
+            g->hist = NULL;
+            return;
+        }
+        g->hist[g->n++] = toks[i];
+    }
+    if (g->tokens >= g->next_report + 1024u) {
+        spec_gate_report(g, "active");
+        g->next_report = g->tokens;
+    }
 }
 
 static void spec_gate_feed(spec_gate *g, int token) {
@@ -10510,6 +10577,10 @@ decode_again:
     dsml_decode_tracker_init(&dsml_tracker);
     spec_gate lookup_gate;
     spec_gate_init(&lookup_gate, &effective_prompt, ds4_session_ctx(s->session));
+    const int spec_lookup_k = spec_lookup_k_env();
+    spec_gate active_lookup;
+    spec_gate_init_enabled(&active_lookup, &effective_prompt,
+                           ds4_session_ctx(s->session), spec_lookup_k >= 2);
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
@@ -10540,7 +10611,35 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        if (temperature <= 0.0f &&
+        if (temperature <= 0.0f && spec_lookup_k >= 2 && active_lookup.hist) {
+            int sdraft[15];
+            const int nd = spec_gate_active_draft(&active_lookup, token, sdraft,
+                                                  spec_lookup_k);
+            if (nd >= 2) {
+                ntok = ds4_session_eval_lookup_argmax(s->session,
+                                                      token,
+                                                      sdraft,
+                                                      nd,
+                                                      max_tokens - completion,
+                                                      ds4_token_eos(s->engine),
+                                                      toks,
+                                                      (int)(sizeof(toks) / sizeof(toks[0])),
+                                                      err,
+                                                      sizeof(err));
+                if (ntok < 0) {
+                    finish = "error";
+                    break;
+                }
+            } else {
+                if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
+                    finish = "error";
+                    break;
+                }
+                toks[0] = token;
+                ntok = 1;
+            }
+            spec_gate_active_commit(&active_lookup, toks, ntok, nd >= 2);
+        } else if (temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -10756,6 +10855,9 @@ decode_again:
         if (stop_decode) break;
     }
     spec_gate_finish(&lookup_gate);
+    spec_gate_report(&active_lookup, "active final");
+    free(active_lookup.hist);
+    active_lookup.hist = NULL;
 
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
