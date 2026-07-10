@@ -6399,6 +6399,7 @@ __global__ static void hc_pre_norm_fused_kernel(
         float *norm_out,
         float *split,
         float *mix_out,
+        float *flat,
         const float *hc,
         const void *fn_w,
         const float *scale,
@@ -6414,7 +6415,6 @@ __global__ static void hc_pre_norm_fused_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
-    __shared__ float flat[8192];
     __shared__ float partial[256];
     __shared__ float wpart[8][32];
     __shared__ float mixs[24];
@@ -6532,6 +6532,7 @@ __global__ static void hc_pre_norm_fused_wide_kernel(
         float *norm_out,
         float *split,
         float *mix_out,
+        float *flat,
         const float *hc,
         const void *fn_w,
         const float *scale,
@@ -6548,7 +6549,6 @@ __global__ static void hc_pre_norm_fused_wide_kernel(
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
     const uint32_t nwarps = blockDim.x >> 5u;
-    __shared__ float flat[8192];
     __shared__ float partial[1024];
     __shared__ float mixs[24];
     __shared__ float sp[24];
@@ -14302,6 +14302,7 @@ extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
         ds4_gpu_tensor       *norm_out,
         ds4_gpu_tensor       *split,
         ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *flat,
         const ds4_gpu_tensor *hc,
         const void             *model_map,
         uint64_t                model_size,
@@ -14316,13 +14317,13 @@ extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
         float                   eps,
         float                   norm_eps) {
     if (getenv("DS4_CUDA_NO_HC_FUSION") != NULL) return hc_fuse_reject("disabled by env");
-    if (!out || !norm_out || !split || !mix || !hc || !model_map ||
+    if (!out || !norm_out || !split || !mix || !flat || !hc || !model_map ||
         n_embd == 0 || n_hc != 4) {
         return hc_fuse_reject("null tensor or unsupported n_hc");
     }
     const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
-    if (hc_dim > 8192u || mix_hc > 24u) return hc_fuse_reject("shape exceeds smem plan");
+    if (mix_hc > 24u) return hc_fuse_reject("mixer wider than the smem plan");
     const uint64_t mix_bytes = mix_hc * sizeof(float);
     const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
     if (out->bytes < out_row_bytes || out->bytes % out_row_bytes != 0 ||
@@ -14330,6 +14331,7 @@ extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
         norm_out->bytes < out_row_bytes ||
         mix->bytes < mix_bytes ||
         split->bytes < mix_bytes ||
+        flat->bytes < hc_dim * sizeof(float) ||
         hc->bytes < hc_dim * sizeof(float)) {
         return hc_fuse_reject("tensor sizes not the single-token decode shape");
     }
@@ -14363,12 +14365,14 @@ extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
             ds4_launch(hc_pre_norm_fused_wide_kernel<true>, 1, 1024, 0,
                     (float *)out->ptr, (float *)norm_out->ptr,
                     (float *)split->ptr, (float *)mix->ptr,
+                    (float *)flat->ptr,
                     (const float *)hc->ptr, fn_w, scale, base, norm_w,
                     n_embd, (uint32_t)hc_dim, (uint32_t)mix_hc, sinkhorn_iters, eps, norm_eps);
         } else {
             ds4_launch(hc_pre_norm_fused_wide_kernel<false>, 1, 1024, 0,
                     (float *)out->ptr, (float *)norm_out->ptr,
                     (float *)split->ptr, (float *)mix->ptr,
+                    (float *)flat->ptr,
                     (const float *)hc->ptr, fn_w, scale, base, norm_w,
                     n_embd, (uint32_t)hc_dim, (uint32_t)mix_hc, sinkhorn_iters, eps, norm_eps);
         }
@@ -14378,12 +14382,14 @@ extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
         ds4_launch(hc_pre_norm_fused_kernel<true>, 1, 256, 0,
                 (float *)out->ptr, (float *)norm_out->ptr,
                 (float *)split->ptr, (float *)mix->ptr,
+                (float *)flat->ptr,
                 (const float *)hc->ptr, fn_w, scale, base, norm_w,
                 n_embd, (uint32_t)hc_dim, (uint32_t)mix_hc, sinkhorn_iters, eps, norm_eps);
     } else {
         ds4_launch(hc_pre_norm_fused_kernel<false>, 1, 256, 0,
                 (float *)out->ptr, (float *)norm_out->ptr,
                 (float *)split->ptr, (float *)mix->ptr,
+                (float *)flat->ptr,
                 (const float *)hc->ptr, fn_w, scale, base, norm_w,
                 n_embd, (uint32_t)hc_dim, (uint32_t)mix_hc, sinkhorn_iters, eps, norm_eps);
     }

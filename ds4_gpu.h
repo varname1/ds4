@@ -1009,6 +1009,7 @@ int ds4_gpu_hc_pre_norm_fused_tensor(
         ds4_gpu_tensor       *norm_out,
         ds4_gpu_tensor       *split,
         ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *flat,
         const ds4_gpu_tensor *hc,
         const void             *model_map,
         uint64_t                model_size,
