@@ -19334,15 +19334,28 @@ static bool metal_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
+    /* Coarse microbatch stage split (attention half vs FFN half) for the
+     * speculative-verify cost hunt; sync-inflated like the decode profiler. */
+    const bool batch_prof =
+        getenv("DS4_SPEC_VERIFY_STAGE_PROFILE") != NULL && n_tokens <= 8u;
+    double batch_prof_t0 = batch_prof ? now_sec() : 0.0;
     bool ok = metal_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
     if (!ok) {
         fprintf(stderr, "ds4: gpu layer %u attention batch encode failed\n", il);
+    }
+    if (ok && batch_prof) {
+        ok = metal_graph_layer_stage_profile_boundary("batch", "attn_part",
+                                                      il, pos0, n_tokens, &batch_prof_t0);
     }
     if (ok) {
         ok = metal_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
         if (!ok) {
             fprintf(stderr, "ds4: gpu layer %u ffn batch encode failed\n", il);
         }
+    }
+    if (ok && batch_prof) {
+        ok = metal_graph_layer_stage_profile_boundary("batch", "ffn_part",
+                                                      il, pos0, n_tokens, &batch_prof_t0);
     }
     if (ok) {
         ds4_gpu_tensor *tmp = g->batch_cur_hc;
