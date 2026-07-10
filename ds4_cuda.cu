@@ -6535,7 +6535,8 @@ __global__ static void hc_pre_norm_fused_kernel(
  * (deterministic), form flat_scale and mix, sinkhorn on thread 0, then the
  * weighted stream sum + weighted RMSNorm block-wide.
  * Deterministic run-to-run, NOT bit-identical to the 3-launch chain
- * (reduction orders differ).  Opt in with DS4_CUDA_HC_FUSION_WIDE=1. */
+ * (reduction orders differ).  This is the default; DS4_CUDA_HC_FUSION_EXACT=1
+ * selects the bit-identical single-block variant instead. */
 #define DS4_HC_FUSE_CHUNKS 16u
 template <bool WF16>
 __global__ static void hc_pre_wide_stage1_kernel(
@@ -14380,7 +14381,7 @@ extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
     const float *norm_w = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
             (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
     if (!fn_w || !scale || !base || !norm_w) return hc_fuse_reject("model range ptr unavailable");
-    const int wide = getenv("DS4_CUDA_HC_FUSION_WIDE") != NULL;
+    const int wide = getenv("DS4_CUDA_HC_FUSION_EXACT") == NULL;
     static int announced = 0;
     if (!announced) {
         fprintf(stderr, "ds4: CUDA hc pre-chain fusion active (%s, %s mixer)\n",
