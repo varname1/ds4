@@ -10187,6 +10187,69 @@ static int attention_decode_batch_launch(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    /* Small microbatches (speculative verify) reuse the tiled decode
+     * attention: one stage1+combine pair per query token with that token's
+     * exact visibility window (replicating the mixed kernel's raw-window and
+     * visible-comp math).  The generic per-(token,head) kernel re-reads the
+     * whole visible KV once per head — measured ~75 ms per 4-token verify
+     * pass at 3.4k context, dominated by exactly that traffic. */
+    if (!use_comp_mask && head_dim == 512u && n_head % DS4_TILED_ATTN_HEADS == 0u &&
+        n_tokens >= 2u && n_tokens <= 8u &&
+        !cuda_token_graph_step_capturing() &&
+        getenv("DS4_CUDA_NO_TILED_ATTENTION") == NULL) {
+        const uint32_t max_rows = (n_raw > 256u ? 256u : n_raw) + n_comp;
+        const uint32_t min_tile = cuda_tiled_attn_tile_rows(max_rows ? max_rows : 1u);
+        const uint32_t max_tiles = max_rows ? (max_rows + min_tile - 1u) / min_tile : 1u;
+        const uint64_t p_bytes = (uint64_t)max_tiles * n_head * head_dim * sizeof(float);
+        const uint64_t ms_bytes = (uint64_t)max_tiles * n_head * 2u * sizeof(float);
+        char *scratch = (char *)cuda_tmp_alloc(p_bytes + ms_bytes,
+                                               "tiled batch attention partials");
+        if (scratch) {
+            float *part_p = (float *)scratch;
+            float *part_ms = (float *)(scratch + p_bytes);
+            const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                const uint32_t qpos = pos0 + t;
+                uint32_t raw_first_idx = 0, raw_count = 0;
+                if (n_raw != 0) {
+                    const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+                    if (qpos >= first_raw_pos) {
+                        uint32_t lo = first_raw_pos;
+                        if (window != 0 && qpos + 1u > window) {
+                            const uint32_t wlo = qpos + 1u - window;
+                            if (wlo > lo) lo = wlo;
+                        }
+                        const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                        if (hi >= lo) {
+                            raw_first_idx = lo - first_raw_pos;
+                            raw_count = hi - lo + 1u;
+                            if (raw_count > 256u) raw_count = 256u;
+                        }
+                    }
+                }
+                uint32_t visible_comp = n_comp ? (qpos + 1u) / ratio : 0u;
+                if (visible_comp > n_comp) visible_comp = n_comp;
+                const uint32_t n_rows = raw_count + visible_comp;
+                const uint32_t t_raw_start = raw_count
+                    ? (raw_start + raw_first_idx) % raw_cap : 0u;
+                const uint32_t tile_rows = cuda_tiled_attn_tile_rows(n_rows ? n_rows : 1u);
+                const uint32_t n_tiles = n_rows ? (n_rows + tile_rows - 1u) / tile_rows : 1u;
+                float *heads_t = (float *)heads->ptr + (uint64_t)t * n_head * head_dim;
+                const float *q_t = (const float *)q->ptr + (uint64_t)t * n_head * head_dim;
+                dim3 tgrid(n_tiles, n_head / DS4_TILED_ATTN_HEADS, 1);
+                ds4_launch(attention_decode_tiled_kernel<false>, tgrid, 256, 0,
+                        part_p, part_ms, q_t, (const float *)raw_kv->ptr,
+                        n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                        raw_count, raw_cap, t_raw_start,
+                        visible_comp, 0u, tile_rows, n_head, head_dim);
+                ds4_launch(attention_decode_tiled_combine_kernel<false>, n_head, 256, 0,
+                        heads_t, part_p, part_ms, sinks,
+                        raw_count, visible_comp, 0u,
+                        tile_rows, n_head, head_dim);
+            }
+            return cuda_ok(cudaGetLastError(), "attention batch tiled launch");
+        }
+    }
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_comp_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
