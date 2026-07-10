@@ -5398,6 +5398,173 @@ __global__ static void attention_decode_mixed_kernel(
     }
 }
 
+/* Tiled decode attention (item 6).  The mixed decode kernel runs one block
+ * per query head, so all 64 MQA heads re-read the ENTIRE visible KV — the
+ * startup microbench measured ~0.36 us per KV row (~10 GB/s per SM), i.e.
+ * ~100 us/layer at short context and 2.5 ms/layer at 6.5k compressed rows.
+ * Compute is negligible (~67 MFLOP); the disease is redundant row traffic.
+ *
+ * Restructure: grid (row_tiles, 8 head_tiles).  Each block streams its
+ * 64-row slice ONCE through shared memory and scores all 8 of its heads
+ * against it (one warp per head), accumulating a flash-style online-softmax
+ * partial (m, s, P[512]) per head.  A combine kernel (one block per head)
+ * merges the row-tile partials in fixed order and adds the sink term.
+ * Deterministic run-to-run; NOT bit-identical to the per-head kernel
+ * (row partitioning and online rescaling change the reduction order).
+ * Decode-only (n_tokens==1, no comp mask); indexed attention keeps the
+ * existing kernels.  Opt in with DS4_CUDA_TILED_ATTENTION=1. */
+enum {
+    DS4_TILED_ATTN_ROWS = 64u,
+    DS4_TILED_ATTN_HEADS = 8u,
+};
+
+template <bool STEP>
+__global__ static void attention_decode_tiled_kernel(
+        float *part_p,        /* [row_tile][n_head][head_dim] */
+        float *part_ms,       /* [row_tile][n_head][2] (m, s) */
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        uint32_t n_raw_arg,
+        uint32_t raw_cap,
+        uint32_t raw_start_arg,
+        uint32_t n_comp_arg,
+        uint32_t step_il,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    ds4_pdl_sync();
+    const uint32_t n_raw_in = STEP ? g_step_state_dev.n_raw : n_raw_arg;
+    const uint32_t raw_start = STEP ? g_step_state_dev.raw_start : raw_start_arg;
+    const uint32_t n_comp = STEP ? g_step_state_dev.n_comp[step_il] : n_comp_arg;
+    const uint32_t raw_count = n_raw_in > 256u ? 256u : n_raw_in;
+    const uint32_t n_rows = raw_count + n_comp;
+    const uint32_t tile = blockIdx.x;
+    const uint32_t h0 = blockIdx.y * DS4_TILED_ATTN_HEADS;
+    const uint32_t r0 = tile * DS4_TILED_ATTN_ROWS;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;   /* warp w owns head h0 + w */
+    uint32_t r1 = r0 + DS4_TILED_ATTN_ROWS;
+    if (r1 > n_rows) r1 = n_rows;
+
+    __shared__ float qs[DS4_TILED_ATTN_HEADS][512];
+    __shared__ float pacc[DS4_TILED_ATTN_HEADS][512];
+    __shared__ float rowbuf[4][512];
+    const float scale = rsqrtf((float)head_dim);
+    const uint32_t h = h0 + warp;
+
+    for (uint32_t i = tid; i < DS4_TILED_ATTN_HEADS * 512u; i += blockDim.x) {
+        const uint32_t hh = i >> 9u;
+        qs[hh][i & 511u] = q[(uint64_t)(h0 + hh) * head_dim + (i & 511u)];
+        pacc[hh][i & 511u] = 0.0f;
+    }
+    __syncthreads();
+
+    float m = -INFINITY;
+    float s = 0.0f;
+    if (r0 < n_rows) {
+        for (uint32_t g0 = r0; g0 < r1; g0 += 4u) {
+            const uint32_t gn = r1 - g0 < 4u ? r1 - g0 : 4u;
+            /* Stage up to 4 rows (8 KB) coalesced — keeps several memory
+             * requests in flight instead of one row per sync. */
+            for (uint32_t i = tid; i < gn * 512u; i += blockDim.x) {
+                const uint32_t gr = i >> 9u;
+                const uint32_t r = g0 + gr;
+                const float *kvrow = r < raw_count
+                    ? raw_kv + (uint64_t)((raw_start + r) % raw_cap) * head_dim
+                    : comp_kv + (uint64_t)(r - raw_count) * head_dim;
+                rowbuf[gr][i & 511u] = kvrow[i & 511u];
+            }
+            __syncthreads();
+            for (uint32_t gr = 0; gr < gn; gr++) {
+                float dot = 0.0f;
+                for (uint32_t d = lane; d < head_dim; d += 32u) {
+                    dot += qs[warp][d] * rowbuf[gr][d];
+                }
+                for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+                    dot += __shfl_down_sync(0xffffffffu, dot, off);
+                }
+                float sc = __shfl_sync(0xffffffffu, dot, 0) * scale;
+                if (sc > m) {
+                    const float factor = expf(m - sc);   /* 0 on first row */
+                    s *= factor;
+                    for (uint32_t d = lane; d < head_dim; d += 32u) {
+                        pacc[warp][d] *= factor;
+                    }
+                    m = sc;
+                }
+                const float e = expf(sc - m);
+                s += e;
+                for (uint32_t d = lane; d < head_dim; d += 32u) {
+                    pacc[warp][d] += e * rowbuf[gr][d];
+                }
+            }
+            __syncthreads();
+        }
+    }
+    /* Write this tile's per-head partials (empty tiles write m=-inf, s=0,
+     * P=0, which the combine treats as a no-op). */
+    for (uint32_t i = tid; i < DS4_TILED_ATTN_HEADS * 512u; i += blockDim.x) {
+        const uint32_t hh = i >> 9u;
+        part_p[((uint64_t)tile * n_head + h0 + hh) * head_dim + (i & 511u)] = pacc[hh][i & 511u];
+    }
+    if (lane == 0 && h < n_head) {
+        part_ms[((uint64_t)tile * n_head + h) * 2u] = m;
+        part_ms[((uint64_t)tile * n_head + h) * 2u + 1u] = s;
+    }
+}
+
+template <bool STEP>
+__global__ static void attention_decode_tiled_combine_kernel(
+        float *heads,
+        const float *part_p,
+        const float *part_ms,
+        const float *sinks,
+        uint32_t n_raw_arg,
+        uint32_t n_comp_arg,
+        uint32_t step_il,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    ds4_pdl_sync();
+    const uint32_t n_raw_in = STEP ? g_step_state_dev.n_raw : n_raw_arg;
+    const uint32_t n_comp = STEP ? g_step_state_dev.n_comp[step_il] : n_comp_arg;
+    const uint32_t raw_count = n_raw_in > 256u ? 256u : n_raw_in;
+    const uint32_t n_rows = raw_count + n_comp;
+    const uint32_t n_tiles = (n_rows + DS4_TILED_ATTN_ROWS - 1u) / DS4_TILED_ATTN_ROWS;
+    const uint32_t h = blockIdx.x;
+    if (h >= n_head) return;
+    const uint32_t tid = threadIdx.x;
+    __shared__ float mM;
+    __shared__ float denom_sh;
+    if (tid == 0) {
+        float M = sinks[h];
+        for (uint32_t i = 0; i < n_tiles; i++) {
+            const float mi = part_ms[((uint64_t)i * n_head + h) * 2u];
+            if (mi > M) M = mi;
+        }
+        float denom = expf(sinks[h] - M);
+        for (uint32_t i = 0; i < n_tiles; i++) {
+            const float mi = part_ms[((uint64_t)i * n_head + h) * 2u];
+            const float si = part_ms[((uint64_t)i * n_head + h) * 2u + 1u];
+            if (si != 0.0f) denom += si * expf(mi - M);
+        }
+        mM = M;
+        denom_sh = denom;
+    }
+    __syncthreads();
+    const float M = mM;
+    const float inv_denom = denom_sh == 0.0f ? 0.0f : 1.0f / denom_sh;
+    for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t i = 0; i < n_tiles; i++) {
+            const float mi = part_ms[((uint64_t)i * n_head + h) * 2u];
+            if (mi == -INFINITY) continue;
+            acc += part_p[((uint64_t)i * n_head + h) * head_dim + d] * expf(mi - M);
+        }
+        heads[(uint64_t)h * head_dim + d] = acc * inv_denom;
+    }
+}
+
 template <bool STEP>
 __global__ static void attention_indexed_mixed_kernel(
         float *heads,
@@ -9742,22 +9909,44 @@ static void cuda_attention_microbench(void) {
     const uint32_t n_head = 64u, head_dim = 512u, raw_cap = 4352u;
     const uint32_t comp_cap = 7000u;
     float *q = NULL, *raw = NULL, *comp = NULL, *heads = NULL, *sinks = NULL;
+    float *heads2 = NULL, *part_p = NULL, *part_ms = NULL;
     const uint64_t qn = (uint64_t)n_head * head_dim;
     const uint64_t rawn = (uint64_t)raw_cap * head_dim;
     const uint64_t compn = (uint64_t)comp_cap * head_dim;
+    const uint32_t max_tiles = (256u + comp_cap + DS4_TILED_ATTN_ROWS - 1u) / DS4_TILED_ATTN_ROWS;
     if (cudaMalloc(&q, qn * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&raw, rawn * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&comp, compn * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&heads, qn * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&heads2, qn * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&part_p, (uint64_t)max_tiles * n_head * head_dim * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&part_ms, (uint64_t)max_tiles * n_head * 2u * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&sinks, n_head * sizeof(float)) != cudaSuccess) {
         fprintf(stderr, "ds4: attn microbench alloc failed\n");
         return;
     }
-    ds4_launch(fill_f32_kernel, (uint32_t)((qn + 255) / 256), 256, 0, q, qn, 0.01f);
-    ds4_launch(fill_f32_kernel, (uint32_t)((rawn + 255) / 256), 256, 0, raw, rawn, 0.02f);
-    ds4_launch(fill_f32_kernel, (uint32_t)((compn + 255) / 256), 256, 0, comp, compn, 0.02f);
-    ds4_launch(fill_f32_kernel, (uint32_t)((n_head + 255) / 256), 256, 0, sinks, (uint64_t)n_head, 0.0f);
+    /* Varied deterministic data — constant fills would make every score
+     * equal and mask softmax/reduction bugs. */
+    {
+        uint64_t total = rawn > compn ? rawn : compn;
+        float *host = (float *)malloc((size_t)(total * sizeof(float)));
+        if (!host) return;
+        uint32_t lcg = 12345u;
+        for (uint64_t i = 0; i < total; i++) {
+            lcg = lcg * 1664525u + 1013904223u;
+            host[i] = ((float)(lcg >> 8) / 16777216.0f - 0.5f) * 0.2f;
+        }
+        (void)cudaMemcpy(raw, host, rawn * sizeof(float), cudaMemcpyHostToDevice);
+        (void)cudaMemcpy(comp, host, compn * sizeof(float), cudaMemcpyHostToDevice);
+        (void)cudaMemcpy(q, host + 999, qn * sizeof(float), cudaMemcpyHostToDevice);
+        (void)cudaMemcpy(sinks, host + 5555, n_head * sizeof(float), cudaMemcpyHostToDevice);
+        free(host);
+    }
     if (cudaDeviceSynchronize() != cudaSuccess) return;
+
+    float *ref_host = (float *)malloc((size_t)(qn * sizeof(float)));
+    float *new_host = (float *)malloc((size_t)(qn * sizeof(float)));
+    if (!ref_host || !new_host) return;
 
     const uint32_t raws[] = {32u, 128u, 256u};
     const uint32_t comps[] = {0u, 8u, 150u, 1000u, 4000u, 6500u};
@@ -9765,46 +9954,59 @@ static void cuda_attention_microbench(void) {
     for (uint32_t ri = 0; ri < sizeof(raws) / sizeof(raws[0]); ri++) {
         for (uint32_t ci = 0; ci < sizeof(comps) / sizeof(comps[0]); ci++) {
             const uint32_t n_raw = raws[ri], n_comp = comps[ci];
-            for (int i = 0; i < 10; i++) {
-                ds4_launch(attention_decode_mixed_kernel<false>, grid, 256, 0,
-                        heads, sinks, q, raw, n_comp ? comp : raw,
-                        (const float *)NULL, 0u,
-                        1u, 8192u, n_raw, raw_cap, 0u, n_comp, 0u,
-                        0u, 0u, n_head, head_dim);
-            }
+            const uint32_t n_rows = (n_raw > 256u ? 256u : n_raw) + n_comp;
+            const uint32_t n_tiles = (n_rows + DS4_TILED_ATTN_ROWS - 1u) / DS4_TILED_ATTN_ROWS;
+            dim3 tgrid(n_tiles, n_head / DS4_TILED_ATTN_HEADS, 1);
+#define DS4_BENCH_REF() \
+            ds4_launch(attention_decode_mixed_kernel<false>, grid, 256, 0, \
+                    heads, sinks, q, raw, n_comp ? comp : raw, \
+                    (const float *)NULL, 0u, \
+                    1u, 8192u, n_raw, raw_cap, 0u, n_comp, 0u, \
+                    0u, 0u, n_head, head_dim)
+#define DS4_BENCH_TILED() \
+            do { \
+                ds4_launch(attention_decode_tiled_kernel<false>, tgrid, 256, 0, \
+                        part_p, part_ms, q, raw, n_comp ? comp : raw, \
+                        n_raw, raw_cap, 0u, n_comp, 0u, n_head, head_dim); \
+                ds4_launch(attention_decode_tiled_combine_kernel<false>, n_head, 256, 0, \
+                        heads2, part_p, part_ms, sinks, \
+                        n_raw, n_comp, 0u, n_head, head_dim); \
+            } while (0)
+            for (int i = 0; i < 10; i++) { DS4_BENCH_REF(); DS4_BENCH_TILED(); }
             if (cudaDeviceSynchronize() != cudaSuccess) {
                 fprintf(stderr, "ds4: attn microbench kernel failed\n");
                 return;
             }
             const int npipe = 100;
             double t0 = bench_now_sec();
-            for (int i = 0; i < npipe; i++) {
-                ds4_launch(attention_decode_mixed_kernel<false>, grid, 256, 0,
-                        heads, sinks, q, raw, n_comp ? comp : raw,
-                        (const float *)NULL, 0u,
-                        1u, 8192u, n_raw, raw_cap, 0u, n_comp, 0u,
-                        0u, 0u, n_head, head_dim);
-            }
+            for (int i = 0; i < npipe; i++) DS4_BENCH_REF();
             (void)cudaDeviceSynchronize();
-            double pipelined_us = (bench_now_sec() - t0) * 1e6 / npipe;
-            const int nlat = 30;
+            double ref_us = (bench_now_sec() - t0) * 1e6 / npipe;
             t0 = bench_now_sec();
-            for (int i = 0; i < nlat; i++) {
-                ds4_launch(attention_decode_mixed_kernel<false>, grid, 256, 0,
-                        heads, sinks, q, raw, n_comp ? comp : raw,
-                        (const float *)NULL, 0u,
-                        1u, 8192u, n_raw, raw_cap, 0u, n_comp, 0u,
-                        0u, 0u, n_head, head_dim);
-                (void)cudaDeviceSynchronize();
+            for (int i = 0; i < npipe; i++) DS4_BENCH_TILED();
+            (void)cudaDeviceSynchronize();
+            double tiled_us = (bench_now_sec() - t0) * 1e6 / npipe;
+            (void)cudaMemcpy(ref_host, heads, qn * sizeof(float), cudaMemcpyDeviceToHost);
+            (void)cudaMemcpy(new_host, heads2, qn * sizeof(float), cudaMemcpyDeviceToHost);
+            double max_abs = 0.0, max_rel = 0.0;
+            for (uint64_t i = 0; i < qn; i++) {
+                const double d = fabs((double)ref_host[i] - (double)new_host[i]);
+                if (d > max_abs) max_abs = d;
+                const double den = fabs((double)ref_host[i]) + 1e-6;
+                if (d / den > max_rel) max_rel = d / den;
             }
-            double latency_us = (bench_now_sec() - t0) * 1e6 / nlat;
             fprintf(stderr,
-                    "ds4: attn bench n_raw=%u n_comp=%u pipelined=%.1f us latency=%.1f us\n",
-                    n_raw, n_comp, pipelined_us, latency_us);
+                    "ds4: attn bench n_raw=%u n_comp=%u ref=%.1f us tiled=%.1f us max_abs=%.3e max_rel=%.3e\n",
+                    n_raw, n_comp, ref_us, tiled_us, max_abs, max_rel);
+#undef DS4_BENCH_REF
+#undef DS4_BENCH_TILED
         }
     }
+    free(ref_host); free(new_host);
     (void)cudaFree(q); (void)cudaFree(raw); (void)cudaFree(comp);
-    (void)cudaFree(heads); (void)cudaFree(sinks);
+    (void)cudaFree(heads); (void)cudaFree(heads2);
+    (void)cudaFree(part_p); (void)cudaFree(part_ms);
+    (void)cudaFree(sinks);
 }
 
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
