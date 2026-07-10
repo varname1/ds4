@@ -1013,6 +1013,7 @@ int ds4_gpu_hc_pre_norm_fused_tensor(
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                fn_weight_offset,
+        int                     fn_is_f16,
         uint64_t                scale_offset,
         uint64_t                base_offset,
         uint64_t                norm_weight_offset,

@@ -14887,7 +14887,8 @@ static bool metal_graph_encode_decode_layer(
         !metal_graph_use_reference_hc_decode() &&
         !metal_graph_use_reference_hc_norm_decode();
     bool hc_pre_chain_fused = false;
-    if (ok && fuse_hc_norm && layer->hc_attn_fn->type == DS4_TENSOR_F16) {
+    if (ok && fuse_hc_norm && (layer->hc_attn_fn->type == DS4_TENSOR_F16 ||
+                               layer->hc_attn_fn->type == DS4_TENSOR_F32)) {
         hc_pre_chain_fused = ds4_gpu_hc_pre_norm_fused_tensor(g->attn_cur,
                                                               g->attn_norm,
                                                               g->hc_split,
@@ -14896,6 +14897,7 @@ static bool metal_graph_encode_decode_layer(
                                                               model->map,
                                                               model->size,
                                                               layer->hc_attn_fn->abs_offset,
+                                                              layer->hc_attn_fn->type == DS4_TENSOR_F16,
                                                               layer->hc_attn_scale->abs_offset,
                                                               layer->hc_attn_base->abs_offset,
                                                               layer->attn_norm->abs_offset,
@@ -15520,7 +15522,8 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
     hc_pre_chain_fused = false;
-    if (ok && fuse_hc_norm && layer->hc_ffn_fn->type == DS4_TENSOR_F16) {
+    if (ok && fuse_hc_norm && (layer->hc_ffn_fn->type == DS4_TENSOR_F16 ||
+                               layer->hc_ffn_fn->type == DS4_TENSOR_F32)) {
         hc_pre_chain_fused = ds4_gpu_hc_pre_norm_fused_tensor(g->ffn_cur,
                                                               g->ffn_norm,
                                                               g->hc_split,
@@ -15529,6 +15532,7 @@ static bool metal_graph_encode_decode_layer(
                                                               model->map,
                                                               model->size,
                                                               layer->hc_ffn_fn->abs_offset,
+                                                              layer->hc_ffn_fn->type == DS4_TENSOR_F16,
                                                               layer->hc_ffn_scale->abs_offset,
                                                               layer->hc_ffn_base->abs_offset,
                                                               layer->ffn_norm->abs_offset,
