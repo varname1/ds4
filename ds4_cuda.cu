@@ -4238,6 +4238,49 @@ __global__ static void matmul_q8_0_preq_warp8_coal_kernel(
     if (lane == 0) out[row] = acc;
 }
 
+/* SoA-layout q8 GEMV: scales and quants in separate contiguous arrays, so
+ * each lane's 32-quant block is a pair of aligned int4 (16 B) vector loads
+ * and the scales stream as their own dense array.  Same per-lane block
+ * order and warp reduce as the direct kernel — bit-identical output; the
+ * weight bytes are identical too (34 B/block), just rearranged. */
+__global__ static void matmul_q8_0_soa_warp8_kernel(
+        float *out,
+        const __half *wscale,     /* [out_dim][blocks] */
+        const int8_t *wq,         /* [out_dim][blocks*32], 16B-aligned rows */
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    ds4_pdl_sync();
+    (void)in_dim;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + warp;
+    if (row >= out_dim) return;
+    const __half *sr = wscale + row * blocks;
+    const int8_t *qr = wq + row * blocks * 32u;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32u;
+        const int4 v0 = *(const int4 *)(qr + i0);
+        const int4 v1 = *(const int4 *)(qr + i0 + 16u);
+        const int8_t *xqb = xq + i0;
+        int dot = 0;
+        dot = __dp4a(v0.x, load_i8x4_i32_aligned(xqb +  0u), dot);
+        dot = __dp4a(v0.y, load_i8x4_i32_aligned(xqb +  4u), dot);
+        dot = __dp4a(v0.z, load_i8x4_i32_aligned(xqb +  8u), dot);
+        dot = __dp4a(v0.w, load_i8x4_i32_aligned(xqb + 12u), dot);
+        dot = __dp4a(v1.x, load_i8x4_i32_aligned(xqb + 16u), dot);
+        dot = __dp4a(v1.y, load_i8x4_i32_aligned(xqb + 20u), dot);
+        dot = __dp4a(v1.z, load_i8x4_i32_aligned(xqb + 24u), dot);
+        dot = __dp4a(v1.w, load_i8x4_i32_aligned(xqb + 28u), dot);
+        acc += __half2float(sr[b]) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
+
 /* K-split decode variants: the warp8 kernels above run one warp per output
  * row, so small-out projections launch too few blocks to occupy an H200
  * (e.g. the grouped attention low projection: low_dim=512 -> 64 blocks on
@@ -10122,15 +10165,24 @@ static void cuda_q8_microbench(void) {
         const uint64_t wbytes = out_dim * blocks * 34u;
         unsigned char *w = NULL;
         float *x = NULL, *out = NULL, *xscale = NULL;
-        int8_t *xq = NULL;
+        int8_t *xq = NULL, *wq_soa = NULL;
+        __half *wscale_soa = NULL;
+        const uint64_t soa_q_bytes = out_dim * blocks * 32u;
+        const uint64_t soa_s_bytes = out_dim * blocks * 2u;
         if (cudaMalloc(&w, wbytes) != cudaSuccess ||
             cudaMalloc(&x, in_dim * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&out, out_dim * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&xq, blocks * 32u) != cudaSuccess ||
+            cudaMalloc(&wq_soa, soa_q_bytes) != cudaSuccess ||
+            cudaMalloc(&wscale_soa, soa_s_bytes) != cudaSuccess ||
             cudaMalloc(&xscale, blocks * sizeof(float)) != cudaSuccess) {
             fprintf(stderr, "ds4: q8 microbench alloc failed\n");
             return;
         }
+        ds4_launch(fill_f32_kernel, (uint32_t)((soa_q_bytes / 4u + 255u) / 256u), 256, 0,
+                (float *)wq_soa, soa_q_bytes / 4u, 0.001f);
+        ds4_launch(fill_f32_kernel, (uint32_t)((soa_s_bytes / 4u + 255u) / 256u), 256, 0,
+                (float *)wscale_soa, soa_s_bytes / 4u, 0.001f);
         ds4_launch(fill_f32_kernel, (uint32_t)((wbytes / 4u + 255u) / 256u), 256, 0,
                 (float *)w, wbytes / 4u, 0.001f);
         ds4_launch(fill_f32_kernel, (uint32_t)((in_dim + 255u) / 256u), 256, 0,
@@ -10167,18 +10219,30 @@ static void cuda_q8_microbench(void) {
         for (int i = 0; i < n; i++) DS4_Q8B_GEMV_COAL();
         (void)cudaDeviceSynchronize();
         const double coal_us = (bench_now_sec() - t0) * 1e6 / n;
+#define DS4_Q8B_GEMV_SOA() \
+        ds4_launch(matmul_q8_0_soa_warp8_kernel, rows_grid, 256, 0, \
+                out, wscale_soa, wq_soa, xq, xscale, in_dim, out_dim, blocks)
+        for (int i = 0; i < 10; i++) DS4_Q8B_GEMV_SOA();
+        (void)cudaDeviceSynchronize();
+        t0 = bench_now_sec();
+        for (int i = 0; i < n; i++) DS4_Q8B_GEMV_SOA();
+        (void)cudaDeviceSynchronize();
+        const double soa_us = (bench_now_sec() - t0) * 1e6 / n;
         fprintf(stderr,
-                "ds4: q8 bench %s %lux%lu quant=%.1f us gemv=%.1f us (%.0f GB/s) coal=%.1f us (%.0f GB/s)\n",
+                "ds4: q8 bench %s %lux%lu quant=%.1f us gemv=%.1f us (%.0f GB/s) coal=%.1f us (%.0f GB/s) soa=%.1f us (%.0f GB/s)\n",
                 shapes[si].name,
                 (unsigned long)in_dim, (unsigned long)out_dim,
                 quant_us,
                 gemv_us, (double)wbytes / gemv_us / 1000.0,
-                coal_us, (double)wbytes / coal_us / 1000.0);
+                coal_us, (double)wbytes / coal_us / 1000.0,
+                soa_us, (double)wbytes / soa_us / 1000.0);
 #undef DS4_Q8B_QUANT
 #undef DS4_Q8B_GEMV
 #undef DS4_Q8B_GEMV_COAL
+#undef DS4_Q8B_GEMV_SOA
         (void)cudaFree(w); (void)cudaFree(x); (void)cudaFree(out);
         (void)cudaFree(xq); (void)cudaFree(xscale);
+        (void)cudaFree(wq_soa); (void)cudaFree(wscale_soa);
     }
 }
 
