@@ -5412,7 +5412,7 @@ __global__ static void attention_decode_mixed_kernel(
  * Deterministic run-to-run; NOT bit-identical to the per-head kernel
  * (row partitioning and online rescaling change the reduction order).
  * Decode-only (n_tokens==1, no comp mask); indexed attention keeps the
- * existing kernels.  Opt in with DS4_CUDA_TILED_ATTENTION=1. */
+ * existing kernels.  Default on; opt out with DS4_CUDA_NO_TILED_ATTENTION=1. */
 enum {
     DS4_TILED_ATTN_ROWS = 64u,   /* max rows per tile == rowbuf capacity plan */
     DS4_TILED_ATTN_HEADS = 8u,
@@ -9869,7 +9869,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
      * stale topology into the captured graph. */
     if (!use_mask && head_dim == 512u && n_head % DS4_TILED_ATTN_HEADS == 0u &&
         !cuda_token_graph_step_capturing() &&
-        getenv("DS4_CUDA_TILED_ATTENTION") != NULL) {
+        getenv("DS4_CUDA_NO_TILED_ATTENTION") == NULL) {
         const uint32_t raw_count = n_raw > 256u ? 256u : n_raw;
         const uint32_t n_rows = raw_count + n_comp;
         const uint32_t tile_rows = cuda_tiled_attn_tile_rows(n_rows);
