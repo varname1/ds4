@@ -4258,6 +4258,132 @@ __global__ static void matmul_q8_0_preq_warp8_coal_kernel(
  * and the scales stream as their own dense array.  Same per-lane block
  * order and warp reduce as the direct kernel — bit-identical output; the
  * weight bytes are identical too (34 B/block), just rearranged. */
+__device__ __forceinline__ static float q8_soa_block_term(
+        const __half *sr, const int8_t *qr, const int8_t *xq_row,
+        const float *xs_row, uint64_t b) {
+    const uint64_t i0 = b * 32u;
+    const int4 v0 = *(const int4 *)(qr + i0);
+    const int4 v1 = *(const int4 *)(qr + i0 + 16u);
+    const int8_t *xqb = xq_row + i0;
+    int dot = 0;
+    dot = __dp4a(v0.x, load_i8x4_i32_aligned(xqb +  0u), dot);
+    dot = __dp4a(v0.y, load_i8x4_i32_aligned(xqb +  4u), dot);
+    dot = __dp4a(v0.z, load_i8x4_i32_aligned(xqb +  8u), dot);
+    dot = __dp4a(v0.w, load_i8x4_i32_aligned(xqb + 12u), dot);
+    dot = __dp4a(v1.x, load_i8x4_i32_aligned(xqb + 16u), dot);
+    dot = __dp4a(v1.y, load_i8x4_i32_aligned(xqb + 20u), dot);
+    dot = __dp4a(v1.z, load_i8x4_i32_aligned(xqb + 24u), dot);
+    dot = __dp4a(v1.w, load_i8x4_i32_aligned(xqb + 28u), dot);
+    return __half2float(sr[b]) * xs_row[b] * (float)dot;
+}
+
+/* SoA clones of the pair / hc-expand / grouped-low preq kernels: identical
+ * per-lane block order and reduces (bit-identical), aligned int4 loads. */
+__global__ static void matmul_q8_0_soa_pair_warp8_kernel(
+        float *out0,
+        float *out1,
+        const __half *s0, const int8_t *q0,
+        const __half *s1, const int8_t *q1,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t blocks) {
+    ds4_pdl_sync();
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out0_dim && row >= out1_dim) return;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    const __half *sr0 = row < out0_dim ? s0 + row * blocks : NULL;
+    const int8_t *qr0 = row < out0_dim ? q0 + row * blocks * 32u : NULL;
+    const __half *sr1 = row < out1_dim ? s1 + row * blocks : NULL;
+    const int8_t *qr1 = row < out1_dim ? q1 + row * blocks * 32u : NULL;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        if (sr0) acc0 += q8_soa_block_term(sr0, qr0, xq, xscale, b);
+        if (sr1) acc1 += q8_soa_block_term(sr1, qr1, xq, xscale, b);
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0) {
+        if (row < out0_dim) out0[row] = acc0;
+        if (row < out1_dim) out1[row] = acc1;
+    }
+}
+
+__global__ static void matmul_q8_0_soa_hc_expand_warp8_kernel(
+        float *out_hc,
+        float *block_out,
+        const float *block_add,
+        const float *residual_hc,
+        const float *split,
+        const __half *wscale, const int8_t *wq,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out_dim,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint64_t blocks,
+        int has_add) {
+    ds4_pdl_sync();
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const __half *sr = wscale + row * blocks;
+    const int8_t *qr = wq + row * blocks * 32u;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        acc += q8_soa_block_term(sr, qr, xq, xscale, b);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) {
+        const uint32_t d = (uint32_t)row;
+        block_out[d] = acc;
+        float block_v = acc;
+        if (has_add) block_v += block_add[d];
+        const float *post = split + n_hc;
+        const float *comb = split + 2u * n_hc;
+        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            float hc_acc = block_v * post[dst_hc];
+            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+                const float comb_v = comb[dst_hc + (uint64_t)src_hc * n_hc];
+                const float res_v = residual_hc[(uint64_t)src_hc * n_embd + d];
+                hc_acc += comb_v * res_v;
+            }
+            out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+        }
+    }
+}
+
+__global__ static void grouped_q8_0_a_soa_warp8_kernel(
+        float *low,
+        const __half *wscale, const int8_t *wq,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t rank,
+        uint32_t n_groups,
+        uint32_t n_tokens,
+        uint64_t blocks,
+        uint64_t low_dim_arg) {
+    ds4_pdl_sync();
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t low_dim = low_dim_arg;
+    if (row >= low_dim || tok >= n_tokens) return;
+    const uint64_t group = row / rank;
+    const __half *sr = wscale + row * blocks;
+    const int8_t *qr = wq + row * blocks * 32u;
+    const uint64_t xrow = tok * (uint64_t)n_groups + group;
+    const int8_t *xqr = xq + xrow * blocks * 32u;
+    const float *xsr = xscale + xrow * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        acc += q8_soa_block_term(sr, qr, xqr, xsr, b);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) low[tok * low_dim + row] = acc;
+}
+
 __global__ static void matmul_q8_0_soa_warp8_kernel(
         float *out,
         const __half *wscale,     /* [out_dim][blocks] */
@@ -9229,6 +9355,19 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
             p1, out1_dim, (uint32_t)ksplit);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair ksplit reduce launch");
     }
+    if (use_dp4a && (in_dim & 31u) == 0u) {
+        const __half *s0 = NULL, *s1 = NULL;
+        const int8_t *q0 = NULL, *q1 = NULL;
+        if (cuda_q8_soa_ptrs(model_map, weight0_offset, weight0_bytes, out0_dim, blocks,
+                             "q8_0_pair0", &s0, &q0) &&
+            cuda_q8_soa_ptrs(model_map, weight1_offset, weight1_bytes, out1_dim, blocks,
+                             "q8_0_pair1", &s1, &q1)) {
+            ds4_launch(matmul_q8_0_soa_pair_warp8_kernel, ((unsigned)max_out + 7u) / 8u, 256, 0,
+                    (float *)out0->ptr, (float *)out1->ptr,
+                    s0, q0, s1, q1, xq, xscale, out0_dim, out1_dim, blocks);
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 soa pair launch");
+        }
+    }
     ds4_launch(matmul_q8_0_pair_preq_warp8_kernel, ((unsigned)max_out + 7u) / 8u, 256, 0, (float *)out0->ptr,
             (float *)out1->ptr,
             reinterpret_cast<const unsigned char *>(w0),
@@ -9304,6 +9443,23 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     const int use_dp4a = cuda_q8_use_dp4a();
     ds4_launch(quantize_q8_0_f32_kernel, (unsigned)blocks, 32, 0, xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
+    if (use_dp4a && (in_dim & 31u) == 0u) {
+        const __half *wsc = NULL;
+        const int8_t *wq = NULL;
+        if (cuda_q8_soa_ptrs(model_map, weight_offset, weight_bytes, out_dim, blocks,
+                             label ? label : "q8_0_hc_expand", &wsc, &wq)) {
+            ds4_launch(matmul_q8_0_soa_hc_expand_warp8_kernel, ((unsigned)out_dim + 7u) / 8u, 256, 0,
+                    (float *)out_hc->ptr,
+                    (float *)block_out->ptr,
+                    block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
+                    (const float *)residual_hc->ptr,
+                    (const float *)split->ptr,
+                    wsc, wq, xq, xscale,
+                    out_dim, n_embd, n_hc, blocks,
+                    block_add ? 1 : 0);
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 soa hc_expand launch");
+        }
+    }
     ds4_launch(matmul_q8_0_hc_expand_preq_warp8_kernel, ((unsigned)out_dim + 7u) / 8u, 256, 0, (float *)out_hc->ptr,
             (float *)block_out->ptr,
             block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
@@ -11177,6 +11333,17 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
         ds4_launch(ksplit_reduce_rows_kernel, ((unsigned)low_dim + 255u) / 256u, 256, 0, (float *)low->ptr,
             partials, low_dim, (uint32_t)ksplit);
         return cuda_ok(cudaGetLastError(), "attention_output_low_q8 reduce launch");
+    }
+    if (use_dp4a && (group_dim & 31u) == 0u) {
+        const __half *wsc = NULL;
+        const int8_t *wq = NULL;
+        if (cuda_q8_soa_ptrs(model_map, out_a_offset, out_a_bytes, low_dim, blocks_a,
+                             "attn_output_a", &wsc, &wq)) {
+            dim3 sgrid(((unsigned)low_dim + 7u) / 8u, 1, 1);
+            ds4_launch(grouped_q8_0_a_soa_warp8_kernel, sgrid, 256, 0, (float *)low->ptr,
+                    wsc, wq, xq, xscale, rank, n_groups, 1u, blocks_a, low_dim);
+            return cuda_ok(cudaGetLastError(), "attention_output_low_q8 soa launch");
+        }
     }
     dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
     ds4_launch(grouped_q8_0_a_preq_warp8_kernel, grid_a, 256, 0, (float *)low->ptr,
