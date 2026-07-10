@@ -6519,22 +6519,68 @@ __global__ static void hc_pre_norm_fused_kernel(
     }
 }
 
-/* Wide variant of the fused HC pre-chain: 1024 threads, and the mixer matmul
- * reads coalesced (lane-stride-32, one warp per row, shuffle-tree reduce) the
- * way matmul_f16_pair_warp4_kernel does.  The exact 256-thread variant above
- * serializes the 393 KB weight read through one warp-chunked pattern per row
- * on a single SM; this one keeps the single launch but restores the memory
- * parallelism.  Deterministic run-to-run, NOT bit-identical to the 3-launch
- * chain (reduction orders differ).  Opt in with DS4_CUDA_HC_FUSION_WIDE=1. */
+/* Wide two-launch variant of the fused HC pre-chain.  The single-block
+ * variants above bottleneck on one SM streaming the ~786 KB f16 mixer matrix
+ * (~10 GB/s effective, ~80 us/site — measured, and exactly what the unfused
+ * chain also pays); the mixer read needs GRID width, not fewer launches.
+ *
+ * Identity used: flat = hc * flat_scale, so mix = fn_w @ flat
+ * = flat_scale * (fn_w @ hc) — the normalized vector never materializes.
+ *
+ * Stage 1, grid (chunks, mix_hc+1) x 128 threads: block (c, r<mix_hc)
+ * computes the partial dot of mixer row r against hc over chunk c; block
+ * (c, mix_hc) computes the partial square sum of hc.  Partials land in the
+ * (otherwise unused) flat scratch, laid out [row][chunk].
+ * Stage 2, one 1024-thread block: reduce partials in fixed chunk order
+ * (deterministic), form flat_scale and mix, sinkhorn on thread 0, then the
+ * weighted stream sum + weighted RMSNorm block-wide.
+ * Deterministic run-to-run, NOT bit-identical to the 3-launch chain
+ * (reduction orders differ).  Opt in with DS4_CUDA_HC_FUSION_WIDE=1. */
+#define DS4_HC_FUSE_CHUNKS 16u
 template <bool WF16>
-__global__ static void hc_pre_norm_fused_wide_kernel(
+__global__ static void hc_pre_wide_stage1_kernel(
+        float *partials,
+        const float *hc,
+        const void *fn_w,
+        uint32_t hc_dim,
+        uint32_t mix_hc) {
+    ds4_pdl_sync();
+    const uint32_t chunk = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t chunk_len = hc_dim / DS4_HC_FUSE_CHUNKS;
+    const uint32_t k0 = chunk * chunk_len;
+    const uint32_t k1 = chunk + 1u == DS4_HC_FUSE_CHUNKS ? hc_dim : k0 + chunk_len;
+    float sum = 0.0f;
+    if (row < mix_hc) {
+        const __half *wrh = (const __half *)fn_w + (uint64_t)row * hc_dim;
+        const float *wrf = (const float *)fn_w + (uint64_t)row * hc_dim;
+        for (uint32_t i = k0 + tid; i < k1; i += blockDim.x) {
+            sum += (WF16 ? __half2float(wrh[i]) : wrf[i]) * hc[i];
+        }
+    } else {
+        for (uint32_t i = k0 + tid; i < k1; i += blockDim.x) {
+            float v = hc[i];
+            sum += v * v;
+        }
+    }
+    __shared__ float partial[128];
+    partial[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) partials[(uint64_t)row * DS4_HC_FUSE_CHUNKS + chunk] = partial[0];
+}
+
+__global__ static void hc_pre_wide_stage2_kernel(
         float *out,
         float *norm_out,
         float *split,
         float *mix_out,
-        float *flat,
+        const float *partials,
         const float *hc,
-        const void *fn_w,
         const float *scale,
         const float *base,
         const float *norm_w,
@@ -6546,59 +6592,40 @@ __global__ static void hc_pre_norm_fused_wide_kernel(
         float norm_eps) {
     ds4_pdl_sync();
     const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t warp = tid >> 5u;
-    const uint32_t nwarps = blockDim.x >> 5u;
     __shared__ float partial[1024];
     __shared__ float mixs[24];
     __shared__ float sp[24];
+    __shared__ float flat_scale_sh;
 
-    /* Phase A: rms_norm_plain of hc -> flat (smem), block-wide tree. */
-    float sum = 0.0f;
-    for (uint32_t i = tid; i < hc_dim; i += blockDim.x) {
-        float v = hc[i];
-        sum += v * v;
-    }
-    partial[tid] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    const float flat_scale = rsqrtf(partial[0] / (float)hc_dim + norm_eps);
-    for (uint32_t i = tid; i < hc_dim; i += blockDim.x) {
-        flat[i] = hc[i] * flat_scale;
+    /* Fixed-order chunk reduces: square sum -> flat_scale, then each mixer
+     * row scaled by it.  One thread per value, serial ascending chunks. */
+    if (tid == 0) {
+        float sq = 0.0f;
+        for (uint32_t c = 0; c < DS4_HC_FUSE_CHUNKS; c++) {
+            sq += partials[(uint64_t)mix_hc * DS4_HC_FUSE_CHUNKS + c];
+        }
+        flat_scale_sh = rsqrtf(sq / (float)hc_dim + norm_eps);
     }
     __syncthreads();
-
-    /* Phase B: mix = fn_w @ flat, one warp per row, coalesced stride-32
-     * reads, fixed shuffle tree. */
-    for (uint32_t row = warp; row < mix_hc; row += nwarps) {
-        const __half *wrh = (const __half *)fn_w + (uint64_t)row * hc_dim;
-        const float *wrf = (const float *)fn_w + (uint64_t)row * hc_dim;
-        float rsum = 0.0f;
-        for (uint32_t i = lane; i < hc_dim; i += 32u) {
-            rsum += (WF16 ? __half2float(wrh[i]) : wrf[i]) * flat[i];
+    if (tid < mix_hc) {
+        float m = 0.0f;
+        for (uint32_t c = 0; c < DS4_HC_FUSE_CHUNKS; c++) {
+            m += partials[(uint64_t)tid * DS4_HC_FUSE_CHUNKS + c];
         }
-        for (uint32_t off = 16u; off > 0u; off >>= 1u) {
-            rsum += __shfl_down_sync(0xffffffffu, rsum, off);
-        }
-        if (lane == 0) {
-            mixs[row] = rsum;
-            mix_out[row] = rsum;
-        }
+        m *= flat_scale_sh;
+        mixs[tid] = m;
+        mix_out[tid] = m;
     }
     __syncthreads();
 
-    /* Phase C: sinkhorn split on thread 0. */
     if (tid == 0) {
         hc4_split_one(sp, mixs, scale, base, sinkhorn_iters, epsv);
         for (uint32_t i = 0; i < mix_hc; i++) split[i] = sp[i];
     }
     __syncthreads();
 
-    /* Phase D: weighted stream sum + weighted RMSNorm, block-wide tree. */
-    sum = 0.0f;
+    /* Weighted stream sum + weighted RMSNorm, block-wide tree. */
+    float sum = 0.0f;
     for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t h = 0; h < 4; h++) {
@@ -14361,22 +14388,28 @@ extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
         announced = 1;
     }
     if (wide) {
-        if (fn_is_f16) {
-            ds4_launch(hc_pre_norm_fused_wide_kernel<true>, 1, 1024, 0,
-                    (float *)out->ptr, (float *)norm_out->ptr,
-                    (float *)split->ptr, (float *)mix->ptr,
-                    (float *)flat->ptr,
-                    (const float *)hc->ptr, fn_w, scale, base, norm_w,
-                    n_embd, (uint32_t)hc_dim, (uint32_t)mix_hc, sinkhorn_iters, eps, norm_eps);
-        } else {
-            ds4_launch(hc_pre_norm_fused_wide_kernel<false>, 1, 1024, 0,
-                    (float *)out->ptr, (float *)norm_out->ptr,
-                    (float *)split->ptr, (float *)mix->ptr,
-                    (float *)flat->ptr,
-                    (const float *)hc->ptr, fn_w, scale, base, norm_w,
-                    n_embd, (uint32_t)hc_dim, (uint32_t)mix_hc, sinkhorn_iters, eps, norm_eps);
+        if (hc_dim % DS4_HC_FUSE_CHUNKS != 0 ||
+            flat->bytes < (uint64_t)(mix_hc + 1u) * DS4_HC_FUSE_CHUNKS * sizeof(float)) {
+            return hc_fuse_reject("wide partial scratch too small");
         }
-        return cuda_ok(cudaGetLastError(), "hc pre norm fused wide launch");
+        dim3 grid1(DS4_HC_FUSE_CHUNKS, (uint32_t)mix_hc + 1u, 1);
+        if (fn_is_f16) {
+            ds4_launch(hc_pre_wide_stage1_kernel<true>, grid1, 128, 0,
+                    (float *)flat->ptr, (const float *)hc->ptr, fn_w,
+                    (uint32_t)hc_dim, (uint32_t)mix_hc);
+        } else {
+            ds4_launch(hc_pre_wide_stage1_kernel<false>, grid1, 128, 0,
+                    (float *)flat->ptr, (const float *)hc->ptr, fn_w,
+                    (uint32_t)hc_dim, (uint32_t)mix_hc);
+        }
+        if (!cuda_ok(cudaGetLastError(), "hc pre wide stage1 launch")) return 0;
+        ds4_launch(hc_pre_wide_stage2_kernel, 1, 1024, 0,
+                (float *)out->ptr, (float *)norm_out->ptr,
+                (float *)split->ptr, (float *)mix->ptr,
+                (const float *)flat->ptr,
+                (const float *)hc->ptr, scale, base, norm_w,
+                n_embd, (uint32_t)hc_dim, (uint32_t)mix_hc, sinkhorn_iters, eps, norm_eps);
+        return cuda_ok(cudaGetLastError(), "hc pre wide stage2 launch");
     }
     if (fn_is_f16) {
         ds4_launch(hc_pre_norm_fused_kernel<true>, 1, 256, 0,
