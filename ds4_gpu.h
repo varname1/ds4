@@ -997,6 +997,33 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         float                   eps,
         float                   norm_eps);
 
+/* Optional whole-chain decode HC pre-sublayer fusion: rms_norm_plain of the
+ * flat HC state, the f16 hc_dim -> mix_hc mixer matmul, the sinkhorn split,
+ * the weighted stream sum, and the weighted RMSNorm in ONE launch.  `hc` is
+ * both the norm input and the residual (they are the same tensor at every
+ * decode call site).  `mix` and `split` are still written for the debug dump
+ * and fusion self-check paths.  A backend without the fused kernel returns 0
+ * and callers fall back to the separate primitives. */
+int ds4_gpu_hc_pre_norm_fused_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *flat,
+        const ds4_gpu_tensor *hc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                fn_weight_offset,
+        int                     fn_is_f16,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                sinkhorn_iters,
+        float                   eps,
+        float                   norm_eps);
+
 int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *pre,

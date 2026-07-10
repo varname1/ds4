@@ -6381,6 +6381,273 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     }
 }
 
+/* Whole-chain decode HC pre-sublayer fusion: rms_norm_plain (1 block) +
+ * matmul_f16_ordered_chunks (mix_hc blocks) + hc_split_weighted_sum_norm
+ * (1 block) collapsed into ONE 256-thread block.  Each phase reproduces the
+ * exact reduction order of the kernel it replaces (same strided partial sums,
+ * same shared-memory trees, same serial 32-partial chunk sum, same thread-0
+ * sinkhorn), so the output is bit-identical to the 3-launch chain.  The three
+ * originals are single-/24-block latency-bound launches with ~us of real work
+ * each; fusing removes two inter-kernel gaps and two full trips through the
+ * 32 KB flat vector.  The mixer weight is F16 or F32 (tensor_expect_plain_
+ * layout allows both); WF16 selects the type-specific phase B that mirrors
+ * the kernel the plain matmul dispatcher would have launched.  Opt out with
+ * DS4_CUDA_NO_HC_FUSION=1. */
+template <bool WF16>
+__global__ static void hc_pre_norm_fused_kernel(
+        float *out,
+        float *norm_out,
+        float *split,
+        float *mix_out,
+        float *flat,
+        const float *hc,
+        const void *fn_w,
+        const float *scale,
+        const float *base,
+        const float *norm_w,
+        uint32_t n_embd,
+        uint32_t hc_dim,
+        uint32_t mix_hc,
+        uint32_t sinkhorn_iters,
+        float epsv,
+        float norm_eps) {
+    ds4_pdl_sync();
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    __shared__ float partial[256];
+    __shared__ float wpart[8][32];
+    __shared__ float mixs[24];
+    __shared__ float sp[24];
+
+    /* Phase A: rms_norm_plain of hc[0..hc_dim) -> flat (smem).  Mirrors
+     * rms_norm_plain_kernel with rows=1, blockDim=256. */
+    float sum = 0.0f;
+    for (uint32_t i = tid; i < hc_dim; i += blockDim.x) {
+        float v = hc[i];
+        sum += v * v;
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float flat_scale = rsqrtf(partial[0] / (float)hc_dim + norm_eps);
+    for (uint32_t i = tid; i < hc_dim; i += blockDim.x) {
+        flat[i] = hc[i] * flat_scale;
+    }
+    __syncthreads();
+
+    /* Phase B: mix = fn_w @ flat, mix_hc rows. */
+    if (WF16) {
+        /* Each warp owns rows warp, warp+8, warp+16, ... and mirrors
+         * matmul_f16_ordered_chunks_kernel exactly: 32 serial per-lane
+         * chunks, then a serial 32-partial sum. */
+        const uint64_t chunk = ((uint64_t)hc_dim + 31u) / 32u;
+        for (uint32_t row = warp; row < mix_hc; row += blockDim.x >> 5u) {
+            const uint64_t k0 = (uint64_t)lane * chunk;
+            uint64_t k1 = k0 + chunk;
+            if (k1 > hc_dim) k1 = hc_dim;
+            const __half *wr = (const __half *)fn_w + (uint64_t)row * hc_dim;
+            float rsum = 0.0f;
+            for (uint64_t i = k0; i < k1; i++) {
+                rsum += __half2float(wr[i]) * flat[i];
+            }
+            wpart[warp][lane] = rsum;
+            __syncwarp();
+            if (lane == 0) {
+                float total = 0.0f;
+                for (uint32_t i = 0; i < 32u; i++) total += wpart[warp][i];
+                mixs[row] = total;
+                mix_out[row] = total;
+            }
+            __syncwarp();
+        }
+    } else {
+        /* Rows in sequence, all 256 threads per row, mirroring
+         * matmul_f32_kernel exactly: strided partial sums + shared tree. */
+        for (uint32_t row = 0; row < mix_hc; row++) {
+            const float *wr = (const float *)fn_w + (uint64_t)row * hc_dim;
+            float rsum = 0.0f;
+            for (uint32_t i = tid; i < hc_dim; i += blockDim.x) {
+                rsum += wr[i] * flat[i];
+            }
+            partial[tid] = rsum;
+            __syncthreads();
+            for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                if (tid < stride) partial[tid] += partial[tid + stride];
+                __syncthreads();
+            }
+            if (tid == 0) {
+                mixs[row] = partial[0];
+                mix_out[row] = partial[0];
+            }
+            __syncthreads();
+        }
+    }
+    __syncthreads();
+
+    /* Phase C: sinkhorn split on thread 0, as in the split/sum/norm kernel. */
+    if (tid == 0) {
+        hc4_split_one(sp, mixs, scale, base, sinkhorn_iters, epsv);
+        for (uint32_t i = 0; i < mix_hc; i++) split[i] = sp[i];
+    }
+    __syncthreads();
+
+    /* Phase D: weighted stream sum + weighted RMSNorm.  Mirrors
+     * hc_split_weighted_sum_norm_fused_kernel with n_rows=1, blockDim=256. */
+    sum = 0.0f;
+    for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t h = 0; h < 4; h++) {
+            acc += hc[(uint64_t)h * n_embd + col] * sp[h];
+        }
+        out[col] = acc;
+        sum += acc * acc;
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
+    for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
+        const float v = out[col];
+        norm_out[col] = v * norm_scale * norm_w[col];
+    }
+}
+
+/* Wide two-launch variant of the fused HC pre-chain.  The single-block
+ * variants above bottleneck on one SM streaming the ~786 KB f16 mixer matrix
+ * (~10 GB/s effective, ~80 us/site — measured, and exactly what the unfused
+ * chain also pays); the mixer read needs GRID width, not fewer launches.
+ *
+ * Identity used: flat = hc * flat_scale, so mix = fn_w @ flat
+ * = flat_scale * (fn_w @ hc) — the normalized vector never materializes.
+ *
+ * Stage 1, grid (chunks, mix_hc+1) x 128 threads: block (c, r<mix_hc)
+ * computes the partial dot of mixer row r against hc over chunk c; block
+ * (c, mix_hc) computes the partial square sum of hc.  Partials land in the
+ * (otherwise unused) flat scratch, laid out [row][chunk].
+ * Stage 2, one 1024-thread block: reduce partials in fixed chunk order
+ * (deterministic), form flat_scale and mix, sinkhorn on thread 0, then the
+ * weighted stream sum + weighted RMSNorm block-wide.
+ * Deterministic run-to-run, NOT bit-identical to the 3-launch chain
+ * (reduction orders differ).  This is the default; DS4_CUDA_HC_FUSION_EXACT=1
+ * selects the bit-identical single-block variant instead. */
+#define DS4_HC_FUSE_CHUNKS 16u
+template <bool WF16>
+__global__ static void hc_pre_wide_stage1_kernel(
+        float *partials,
+        const float *hc,
+        const void *fn_w,
+        uint32_t hc_dim,
+        uint32_t mix_hc) {
+    ds4_pdl_sync();
+    const uint32_t chunk = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t chunk_len = hc_dim / DS4_HC_FUSE_CHUNKS;
+    const uint32_t k0 = chunk * chunk_len;
+    const uint32_t k1 = chunk + 1u == DS4_HC_FUSE_CHUNKS ? hc_dim : k0 + chunk_len;
+    float sum = 0.0f;
+    if (row < mix_hc) {
+        const __half *wrh = (const __half *)fn_w + (uint64_t)row * hc_dim;
+        const float *wrf = (const float *)fn_w + (uint64_t)row * hc_dim;
+        for (uint32_t i = k0 + tid; i < k1; i += blockDim.x) {
+            sum += (WF16 ? __half2float(wrh[i]) : wrf[i]) * hc[i];
+        }
+    } else {
+        for (uint32_t i = k0 + tid; i < k1; i += blockDim.x) {
+            float v = hc[i];
+            sum += v * v;
+        }
+    }
+    __shared__ float partial[128];
+    partial[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) partials[(uint64_t)row * DS4_HC_FUSE_CHUNKS + chunk] = partial[0];
+}
+
+__global__ static void hc_pre_wide_stage2_kernel(
+        float *out,
+        float *norm_out,
+        float *split,
+        float *mix_out,
+        const float *partials,
+        const float *hc,
+        const float *scale,
+        const float *base,
+        const float *norm_w,
+        uint32_t n_embd,
+        uint32_t hc_dim,
+        uint32_t mix_hc,
+        uint32_t sinkhorn_iters,
+        float epsv,
+        float norm_eps) {
+    ds4_pdl_sync();
+    const uint32_t tid = threadIdx.x;
+    __shared__ float partial[1024];
+    __shared__ float mixs[24];
+    __shared__ float sp[24];
+    __shared__ float flat_scale_sh;
+
+    /* Fixed-order chunk reduces: square sum -> flat_scale, then each mixer
+     * row scaled by it.  One thread per value, serial ascending chunks. */
+    if (tid == 0) {
+        float sq = 0.0f;
+        for (uint32_t c = 0; c < DS4_HC_FUSE_CHUNKS; c++) {
+            sq += partials[(uint64_t)mix_hc * DS4_HC_FUSE_CHUNKS + c];
+        }
+        flat_scale_sh = rsqrtf(sq / (float)hc_dim + norm_eps);
+    }
+    __syncthreads();
+    if (tid < mix_hc) {
+        float m = 0.0f;
+        for (uint32_t c = 0; c < DS4_HC_FUSE_CHUNKS; c++) {
+            m += partials[(uint64_t)tid * DS4_HC_FUSE_CHUNKS + c];
+        }
+        m *= flat_scale_sh;
+        mixs[tid] = m;
+        mix_out[tid] = m;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        hc4_split_one(sp, mixs, scale, base, sinkhorn_iters, epsv);
+        for (uint32_t i = 0; i < mix_hc; i++) split[i] = sp[i];
+    }
+    __syncthreads();
+
+    /* Weighted stream sum + weighted RMSNorm, block-wide tree. */
+    float sum = 0.0f;
+    for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t h = 0; h < 4; h++) {
+            acc += hc[(uint64_t)h * n_embd + col] * sp[h];
+        }
+        out[col] = acc;
+        sum += acc * acc;
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
+    for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
+        const float v = out[col];
+        norm_out[col] = v * norm_scale * norm_w[col];
+    }
+}
+
 __global__ static void output_hc_weights_kernel(
         float *out,
         const float *pre,
@@ -14044,6 +14311,123 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
                                                   sinkhorn_iters, eps) &&
            ds4_gpu_rms_norm_weight_tensor(norm_out, out, model_map, model_size,
                                             norm_weight_offset, n_embd, norm_eps);
+}
+
+/* One-shot reject diagnostic: the fusion falling back must be visible in the
+ * server log, not silent (a silent fallback is indistinguishable from an
+ * active fusion — both produce identical output). */
+static int hc_fuse_reject(const char *why) {
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr, "ds4: CUDA hc pre-chain fusion unavailable: %s\n", why);
+        warned = 1;
+    }
+    return 0;
+}
+
+extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *flat,
+        const ds4_gpu_tensor *hc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                fn_weight_offset,
+        int                     fn_is_f16,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                sinkhorn_iters,
+        float                   eps,
+        float                   norm_eps) {
+    if (getenv("DS4_CUDA_NO_HC_FUSION") != NULL) return hc_fuse_reject("disabled by env");
+    if (!out || !norm_out || !split || !mix || !flat || !hc || !model_map ||
+        n_embd == 0 || n_hc != 4) {
+        return hc_fuse_reject("null tensor or unsupported n_hc");
+    }
+    const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    if (mix_hc > 24u) return hc_fuse_reject("mixer wider than the smem plan");
+    const uint64_t mix_bytes = mix_hc * sizeof(float);
+    const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
+    if (out->bytes < out_row_bytes || out->bytes % out_row_bytes != 0 ||
+        out->bytes / out_row_bytes != 1 ||
+        norm_out->bytes < out_row_bytes ||
+        mix->bytes < mix_bytes ||
+        split->bytes < mix_bytes ||
+        flat->bytes < hc_dim * sizeof(float) ||
+        hc->bytes < hc_dim * sizeof(float)) {
+        return hc_fuse_reject("tensor sizes not the single-token decode shape");
+    }
+    const uint64_t fn_bytes = mix_hc * hc_dim *
+        (fn_is_f16 ? sizeof(uint16_t) : sizeof(float));
+    if (fn_weight_offset > model_size || fn_bytes > model_size - fn_weight_offset ||
+        scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
+        base_offset > model_size || mix_bytes > model_size - base_offset ||
+        norm_weight_offset > model_size ||
+        (uint64_t)n_embd * sizeof(float) > model_size - norm_weight_offset) {
+        return hc_fuse_reject("weight offsets out of model range");
+    }
+    const void *fn_w = (const void *)cuda_model_range_ptr(model_map, fn_weight_offset,
+            fn_bytes, "hc_fn");
+    const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset,
+            3ull * sizeof(float), "hc_scale");
+    const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset,
+            mix_bytes, "hc_base");
+    const float *norm_w = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
+            (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
+    if (!fn_w || !scale || !base || !norm_w) return hc_fuse_reject("model range ptr unavailable");
+    const int wide = getenv("DS4_CUDA_HC_FUSION_EXACT") == NULL;
+    static int announced = 0;
+    if (!announced) {
+        fprintf(stderr, "ds4: CUDA hc pre-chain fusion active (%s, %s mixer)\n",
+                wide ? "wide" : "exact", fn_is_f16 ? "f16" : "f32");
+        announced = 1;
+    }
+    if (wide) {
+        if (hc_dim % DS4_HC_FUSE_CHUNKS != 0 ||
+            flat->bytes < (uint64_t)(mix_hc + 1u) * DS4_HC_FUSE_CHUNKS * sizeof(float)) {
+            return hc_fuse_reject("wide partial scratch too small");
+        }
+        dim3 grid1(DS4_HC_FUSE_CHUNKS, (uint32_t)mix_hc + 1u, 1);
+        if (fn_is_f16) {
+            ds4_launch(hc_pre_wide_stage1_kernel<true>, grid1, 128, 0,
+                    (float *)flat->ptr, (const float *)hc->ptr, fn_w,
+                    (uint32_t)hc_dim, (uint32_t)mix_hc);
+        } else {
+            ds4_launch(hc_pre_wide_stage1_kernel<false>, grid1, 128, 0,
+                    (float *)flat->ptr, (const float *)hc->ptr, fn_w,
+                    (uint32_t)hc_dim, (uint32_t)mix_hc);
+        }
+        if (!cuda_ok(cudaGetLastError(), "hc pre wide stage1 launch")) return 0;
+        ds4_launch(hc_pre_wide_stage2_kernel, 1, 1024, 0,
+                (float *)out->ptr, (float *)norm_out->ptr,
+                (float *)split->ptr, (float *)mix->ptr,
+                (const float *)flat->ptr,
+                (const float *)hc->ptr, scale, base, norm_w,
+                n_embd, (uint32_t)hc_dim, (uint32_t)mix_hc, sinkhorn_iters, eps, norm_eps);
+        return cuda_ok(cudaGetLastError(), "hc pre wide stage2 launch");
+    }
+    if (fn_is_f16) {
+        ds4_launch(hc_pre_norm_fused_kernel<true>, 1, 256, 0,
+                (float *)out->ptr, (float *)norm_out->ptr,
+                (float *)split->ptr, (float *)mix->ptr,
+                (float *)flat->ptr,
+                (const float *)hc->ptr, fn_w, scale, base, norm_w,
+                n_embd, (uint32_t)hc_dim, (uint32_t)mix_hc, sinkhorn_iters, eps, norm_eps);
+    } else {
+        ds4_launch(hc_pre_norm_fused_kernel<false>, 1, 256, 0,
+                (float *)out->ptr, (float *)norm_out->ptr,
+                (float *)split->ptr, (float *)mix->ptr,
+                (float *)flat->ptr,
+                (const float *)hc->ptr, fn_w, scale, base, norm_w,
+                n_embd, (uint32_t)hc_dim, (uint32_t)mix_hc, sinkhorn_iters, eps, norm_eps);
+    }
+    return cuda_ok(cudaGetLastError(), "hc pre norm fused launch");
 }
 extern "C" int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,
