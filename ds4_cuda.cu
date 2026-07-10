@@ -6491,6 +6491,105 @@ __global__ static void hc_pre_norm_fused_kernel(
     }
 }
 
+/* Wide variant of the fused HC pre-chain: 1024 threads, and the mixer matmul
+ * reads coalesced (lane-stride-32, one warp per row, shuffle-tree reduce) the
+ * way matmul_f16_pair_warp4_kernel does.  The exact 256-thread variant above
+ * serializes the 393 KB weight read through one warp-chunked pattern per row
+ * on a single SM; this one keeps the single launch but restores the memory
+ * parallelism.  Deterministic run-to-run, NOT bit-identical to the 3-launch
+ * chain (reduction orders differ).  Opt in with DS4_CUDA_HC_FUSION_WIDE=1. */
+__global__ static void hc_pre_norm_fused_wide_kernel(
+        float *out,
+        float *norm_out,
+        float *split,
+        float *mix_out,
+        const float *hc,
+        const __half *fn_w,
+        const float *scale,
+        const float *base,
+        const float *norm_w,
+        uint32_t n_embd,
+        uint32_t hc_dim,
+        uint32_t mix_hc,
+        uint32_t sinkhorn_iters,
+        float epsv,
+        float norm_eps) {
+    ds4_pdl_sync();
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t nwarps = blockDim.x >> 5u;
+    __shared__ float flat[8192];
+    __shared__ float partial[1024];
+    __shared__ float mixs[24];
+    __shared__ float sp[24];
+
+    /* Phase A: rms_norm_plain of hc -> flat (smem), block-wide tree. */
+    float sum = 0.0f;
+    for (uint32_t i = tid; i < hc_dim; i += blockDim.x) {
+        float v = hc[i];
+        sum += v * v;
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float flat_scale = rsqrtf(partial[0] / (float)hc_dim + norm_eps);
+    for (uint32_t i = tid; i < hc_dim; i += blockDim.x) {
+        flat[i] = hc[i] * flat_scale;
+    }
+    __syncthreads();
+
+    /* Phase B: mix = fn_w @ flat, one warp per row, coalesced stride-32
+     * reads, fixed shuffle tree. */
+    for (uint32_t row = warp; row < mix_hc; row += nwarps) {
+        const __half *wr = fn_w + (uint64_t)row * hc_dim;
+        float rsum = 0.0f;
+        for (uint32_t i = lane; i < hc_dim; i += 32u) {
+            rsum += __half2float(wr[i]) * flat[i];
+        }
+        for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+            rsum += __shfl_down_sync(0xffffffffu, rsum, off);
+        }
+        if (lane == 0) {
+            mixs[row] = rsum;
+            mix_out[row] = rsum;
+        }
+    }
+    __syncthreads();
+
+    /* Phase C: sinkhorn split on thread 0. */
+    if (tid == 0) {
+        hc4_split_one(sp, mixs, scale, base, sinkhorn_iters, epsv);
+        for (uint32_t i = 0; i < mix_hc; i++) split[i] = sp[i];
+    }
+    __syncthreads();
+
+    /* Phase D: weighted stream sum + weighted RMSNorm, block-wide tree. */
+    sum = 0.0f;
+    for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t h = 0; h < 4; h++) {
+            acc += hc[(uint64_t)h * n_embd + col] * sp[h];
+        }
+        out[col] = acc;
+        sum += acc * acc;
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
+    for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
+        const float v = out[col];
+        norm_out[col] = v * norm_scale * norm_w[col];
+    }
+}
+
 __global__ static void output_hc_weights_kernel(
         float *out,
         const float *pre,
@@ -14208,6 +14307,27 @@ extern "C" int ds4_gpu_hc_pre_norm_fused_tensor(
     const float *norm_w = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
             (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
     if (!fn_w || !scale || !base || !norm_w) return 0;
+    const int wide = getenv("DS4_CUDA_HC_FUSION_WIDE") != NULL;
+    static int announced = 0;
+    if (!announced) {
+        fprintf(stderr, "ds4: CUDA hc pre-chain fusion active (%s)\n",
+                wide ? "wide" : "exact");
+        announced = 1;
+    }
+    if (wide) {
+        ds4_launch(hc_pre_norm_fused_wide_kernel, 1, 1024, 0,
+                (float *)out->ptr,
+                (float *)norm_out->ptr,
+                (float *)split->ptr,
+                (float *)mix->ptr,
+                (const float *)hc->ptr,
+                fn_w,
+                scale,
+                base,
+                norm_w,
+                n_embd, (uint32_t)hc_dim, (uint32_t)mix_hc, sinkhorn_iters, eps, norm_eps);
+        return cuda_ok(cudaGetLastError(), "hc pre norm fused wide launch");
+    }
     ds4_launch(hc_pre_norm_fused_kernel, 1, 256, 0,
             (float *)out->ptr,
             (float *)norm_out->ptr,
