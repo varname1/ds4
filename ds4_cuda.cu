@@ -2347,6 +2347,8 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+static void cuda_attention_microbench(void);
+
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
@@ -2368,6 +2370,7 @@ extern "C" int ds4_gpu_init(void) {
         (void)cublasSetMathMode(g_cublas, math_mode);
         g_cublas_ready = 1;
     }
+    if (getenv("DS4_CUDA_ATTN_MICROBENCH") != NULL) cuda_attention_microbench();
     return 1;
 }
 
@@ -9721,6 +9724,89 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     }
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
+/* Startup microbenchmark for the decode attention kernel, DS4_CUDA_ATTN_
+ * MICROBENCH=1.  Times attention_decode_mixed_kernel over synthetic buffers
+ * across the realistic n_raw x n_comp range, both pipelined (100 back-to-back
+ * launches, one sync — what a PDL-chained decode pays) and latency (launch +
+ * sync each — what the stage profiler sees).  Runs at ds4_gpu_init, before
+ * any model load, and needs no weights: the kernel takes raw device pointers.
+ * Motivation: the stage profiler cannot separate kernel-geometry cost from
+ * data volume, and item-5 taught us not to guess. */
+static double bench_now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void cuda_attention_microbench(void) {
+    const uint32_t n_head = 64u, head_dim = 512u, raw_cap = 4352u;
+    const uint32_t comp_cap = 7000u;
+    float *q = NULL, *raw = NULL, *comp = NULL, *heads = NULL, *sinks = NULL;
+    const uint64_t qn = (uint64_t)n_head * head_dim;
+    const uint64_t rawn = (uint64_t)raw_cap * head_dim;
+    const uint64_t compn = (uint64_t)comp_cap * head_dim;
+    if (cudaMalloc(&q, qn * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&raw, rawn * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&comp, compn * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&heads, qn * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&sinks, n_head * sizeof(float)) != cudaSuccess) {
+        fprintf(stderr, "ds4: attn microbench alloc failed\n");
+        return;
+    }
+    ds4_launch(fill_f32_kernel, (uint32_t)((qn + 255) / 256), 256, 0, q, qn, 0.01f);
+    ds4_launch(fill_f32_kernel, (uint32_t)((rawn + 255) / 256), 256, 0, raw, rawn, 0.02f);
+    ds4_launch(fill_f32_kernel, (uint32_t)((compn + 255) / 256), 256, 0, comp, compn, 0.02f);
+    ds4_launch(fill_f32_kernel, (uint32_t)((n_head + 255) / 256), 256, 0, sinks, (uint64_t)n_head, 0.0f);
+    if (cudaDeviceSynchronize() != cudaSuccess) return;
+
+    const uint32_t raws[] = {32u, 128u, 256u};
+    const uint32_t comps[] = {0u, 8u, 150u, 1000u, 4000u, 6500u};
+    dim3 grid(1, n_head, 1);
+    for (uint32_t ri = 0; ri < sizeof(raws) / sizeof(raws[0]); ri++) {
+        for (uint32_t ci = 0; ci < sizeof(comps) / sizeof(comps[0]); ci++) {
+            const uint32_t n_raw = raws[ri], n_comp = comps[ci];
+            for (int i = 0; i < 10; i++) {
+                ds4_launch(attention_decode_mixed_kernel<false>, grid, 256, 0,
+                        heads, sinks, q, raw, n_comp ? comp : raw,
+                        (const float *)NULL, 0u,
+                        1u, 8192u, n_raw, raw_cap, 0u, n_comp, 0u,
+                        0u, 0u, n_head, head_dim);
+            }
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                fprintf(stderr, "ds4: attn microbench kernel failed\n");
+                return;
+            }
+            const int npipe = 100;
+            double t0 = bench_now_sec();
+            for (int i = 0; i < npipe; i++) {
+                ds4_launch(attention_decode_mixed_kernel<false>, grid, 256, 0,
+                        heads, sinks, q, raw, n_comp ? comp : raw,
+                        (const float *)NULL, 0u,
+                        1u, 8192u, n_raw, raw_cap, 0u, n_comp, 0u,
+                        0u, 0u, n_head, head_dim);
+            }
+            (void)cudaDeviceSynchronize();
+            double pipelined_us = (bench_now_sec() - t0) * 1e6 / npipe;
+            const int nlat = 30;
+            t0 = bench_now_sec();
+            for (int i = 0; i < nlat; i++) {
+                ds4_launch(attention_decode_mixed_kernel<false>, grid, 256, 0,
+                        heads, sinks, q, raw, n_comp ? comp : raw,
+                        (const float *)NULL, 0u,
+                        1u, 8192u, n_raw, raw_cap, 0u, n_comp, 0u,
+                        0u, 0u, n_head, head_dim);
+                (void)cudaDeviceSynchronize();
+            }
+            double latency_us = (bench_now_sec() - t0) * 1e6 / nlat;
+            fprintf(stderr,
+                    "ds4: attn bench n_raw=%u n_comp=%u pipelined=%.1f us latency=%.1f us\n",
+                    n_raw, n_comp, pipelined_us, latency_us);
+        }
+    }
+    (void)cudaFree(q); (void)cudaFree(raw); (void)cudaFree(comp);
+    (void)cudaFree(heads); (void)cudaFree(sinks);
+}
+
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
         model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
