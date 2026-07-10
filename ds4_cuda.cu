@@ -218,6 +218,7 @@ typedef struct {
 static std::unordered_map<uint64_t, cuda_q8_soa_entry> g_q8_soa_by_offset;
 static uint64_t g_q8_soa_bytes;
 static int g_q8_soa_disabled;
+static void cuda_q8_soa_cache_release_all(void);
 static uint64_t g_q8_f32_bytes;
 static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_budget_notice_printed;
